@@ -254,7 +254,7 @@ See **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** for full deployment instructi
 
 ## About
 
-Senior automation engineer specialising in n8n, API integration, and AI-augmented business processes. Experienced building production automation infrastructure for SaaS, agencies, and enterprise clients.
+Anoop Shukla Senior automation engineer specialising in n8n, API integration, and AI-augmented business processes. Experienced building production automation infrastructure for SaaS, agencies, and enterprise clients.
 
 Focused on: reliability, observability, security, and maintainability — not just "it works".
 
