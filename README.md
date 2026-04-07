@@ -1,4 +1,4 @@
-# n8n Automation Portfolio — v2
+# n8n Automation Portfolio — Anoop Shukla
 
 **Senior n8n Developer · Automation Architect · AI Integration Engineer**
 
