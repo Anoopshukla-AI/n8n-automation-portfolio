@@ -1,0 +1,142 @@
+{
+  "name": "[SHARED] Global Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "00000001-0000-0000-0000-000000000001",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/*\n * GLOBAL ERROR HANDLER\n * ─────────────────────────────────────────────────────────────────\n * Receives execution failures from any workflow that sets:\n *   settings.errorWorkflow = '[SHARED] Global Error Handler'\n *\n * Enriches the error with context, applies severity triage,\n * then fans out to Slack, Google Sheets, and optionally PagerDuty.\n */\n\nconst execData = $input.first().json;\n\n// ── Classify error severity ────────────────────────────────────────\nconst CRITICAL_WORKFLOWS = [\n  'wf.etl-pipeline',\n  'wf.crm-sync',\n  'wf.lead-enrichment'\n];\n\nconst workflowName  = execData.workflow?.name  || 'unknown';\nconst workflowId    = execData.workflow?.id    || 'unknown';\nconst executionId   = execData.execution?.id   || 'unknown';\nconst executionMode = execData.execution?.mode || 'unknown';\nconst errorMessage  = execData.execution?.error?.message || 'No error message';\nconst errorStack    = execData.execution?.error?.stack   || '';\nconst lastNode      = execData.execution?.lastNodeExecuted || 'unknown';\nconst startedAt     = execData.execution?.startedAt || new Date().toISOString();\n\nconst isCritical    = CRITICAL_WORKFLOWS.some(w => workflowName.includes(w));\nconst severity      = isCritical ? 'CRITICAL' : 'ERROR';\n\n// ── Build error record ─────────────────────────────────────────────\nconst traceId = `err-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;\n\nconst errorRecord = {\n  traceId,\n  severity,\n  timestamp: new Date().toISOString(),\n  workflow: {\n    name: workflowName,\n    id:   workflowId\n  },\n  execution: {\n    id:        executionId,\n    mode:      executionMode,\n    startedAt,\n    lastNode\n  },\n  error: {\n    message: errorMessage,\n    stack:   errorStack.slice(0, 1000)  // cap stack trace length\n  },\n  runbookUrl: `https://wiki.yourcompany.com/runbooks/${workflowName.replace(/\\s+/g, '-').toLowerCase()}`,\n  n8nUiUrl:   `${process.env.N8N_HOST || 'http://localhost:5678'}/workflow/${workflowId}/executions/${executionId}`\n};\n\n// ── Slack message (Block Kit) ──────────────────────────────────────\nconst severityEmoji = severity === 'CRITICAL' ? '🚨' : '🔴';\n\nconst slackBlocks = [\n  {\n    type: 'header',\n    text: { type: 'plain_text', text: `${severityEmoji} Workflow Failure: ${workflowName}`, emoji: true }\n  },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Severity:*\\n${severity}` },\n      { type: 'mrkdwn', text: `*Workflow:*\\n${workflowName}` },\n      { type: 'mrkdwn', text: `*Execution ID:*\\n\\`${executionId}\\`` },\n      { type: 'mrkdwn', text: `*Failed Node:*\\n\\`${lastNode}\\`` },\n      { type: 'mrkdwn', text: `*Mode:*\\n${executionMode}` },\n      { type: 'mrkdwn', text: `*Trace ID:*\\n\\`${traceId}\\`` }\n    ]\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*Error:*\\n\\`\\`\\`${errorMessage.slice(0, 300)}\\`\\`\\`` }\n  },\n  {\n    type: 'actions',\n    elements: [\n      {\n        type: 'button',\n        style: 'danger',\n        text: { type: 'plain_text', text: '🔍 View Execution' },\n        url:  errorRecord.n8nUiUrl\n      },\n      {\n        type: 'button',\n        text: { type: 'plain_text', text: '📖 Runbook' },\n        url:  errorRecord.runbookUrl\n      }\n    ]\n  },\n  { type: 'divider' }\n];\n\nreturn [{\n  json: {\n    errorRecord,\n    slackChannel: isCritical ? '#oncall-alerts' : '#automation-errors',\n    slackBlocks,\n    slackText: `[${severity}] ${workflowName} failed at node \\`${lastNode}\\`: ${errorMessage.slice(0, 150)}`\n  }\n}];"
+      },
+      "id": "00000001-0000-0000-0000-000000000002",
+      "name": "fn.TriageAndEnrich",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "channel":  "={{$json.slackChannel}}",
+        "blocksUi": { "blocksValues": "={{$json.slackBlocks}}" },
+        "text":     "={{$json.slackText}}",
+        "otherOptions": {}
+      },
+      "id": "00000001-0000-0000-0000-000000000003",
+      "name": "sink.Slack.ErrorAlert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [680, 200],
+      "continueOnFail": true,
+      "credentials": {
+        "slackApi": {
+          "id": "cred-slack",
+          "name": "Slack — Automation Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.LOG_SHEET_ID}}",
+        "sheetName": "error_log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp":     "={{$json.errorRecord.timestamp}}",
+            "traceId":       "={{$json.errorRecord.traceId}}",
+            "severity":      "={{$json.errorRecord.severity}}",
+            "workflowName":  "={{$json.errorRecord.workflow.name}}",
+            "workflowId":    "={{$json.errorRecord.workflow.id}}",
+            "executionId":   "={{$json.errorRecord.execution.id}}",
+            "lastNode":      "={{$json.errorRecord.execution.lastNode}}",
+            "errorMessage":  "={{$json.errorRecord.error.message}}",
+            "errorStack":    "={{$json.errorRecord.error.stack}}",
+            "n8nUiUrl":      "={{$json.errorRecord.n8nUiUrl}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "00000001-0000-0000-0000-000000000004",
+      "name": "sink.Sheets.ErrorLog",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [680, 360],
+      "continueOnFail": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "cred-google-sheets",
+          "name": "Google Sheets — Service Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.errorRecord.severity}}",
+              "operation": "equal",
+              "value2": "CRITICAL"
+            }
+          ]
+        }
+      },
+      "id": "00000001-0000-0000-0000-000000000005",
+      "name": "gate.IsCritical?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://events.pagerduty.com/v2/enqueue",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"routing_key\": \"{{$env.PAGERDUTY_ROUTING_KEY}}\",\n  \"event_action\": \"trigger\",\n  \"dedup_key\": \"{{$json.errorRecord.traceId}}\",\n  \"payload\": {\n    \"summary\": \"[CRITICAL] {{$json.errorRecord.workflow.name}} failed: {{$json.errorRecord.error.message}}\",\n    \"severity\": \"critical\",\n    \"source\": \"n8n-automation\",\n    \"custom_details\": {\n      \"workflow\": \"{{$json.errorRecord.workflow.name}}\",\n      \"execution_id\": \"{{$json.errorRecord.execution.id}}\",\n      \"failed_node\": \"{{$json.errorRecord.execution.lastNode}}\",\n      \"trace_id\": \"{{$json.errorRecord.traceId}}\",\n      \"runbook_url\": \"{{$json.errorRecord.runbookUrl}}\"\n    }\n  },\n  \"links\": [{ \"href\": \"{{$json.errorRecord.n8nUiUrl}}\", \"text\": \"View Execution\" }]\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "00000001-0000-0000-0000-000000000006",
+      "name": "sink.PagerDuty",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1120, 200],
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "fn.TriageAndEnrich", "type": "main", "index": 0 }]]
+    },
+    "fn.TriageAndEnrich": {
+      "main": [[
+        { "node": "sink.Slack.ErrorAlert",  "type": "main", "index": 0 },
+        { "node": "sink.Sheets.ErrorLog",   "type": "main", "index": 0 },
+        { "node": "gate.IsCritical?",       "type": "main", "index": 0 }
+      ]]
+    },
+    "gate.IsCritical?": {
+      "main": [
+        [{ "node": "sink.PagerDuty", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "executionOrder": "v1",
+    "callerPolicy": "any"
+  },
+  "staticData": null,
+  "tags": ["shared", "infrastructure", "error-handling"],
+  "triggerCount": 0,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "v2.0.0"
+}

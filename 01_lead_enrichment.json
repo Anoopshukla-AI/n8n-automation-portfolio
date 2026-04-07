@@ -1,0 +1,360 @@
+{
+  "name": "wf.lead-enrichment",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path":       "v1/leads/ingest",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true,
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000001",
+      "name": "trigger.WebhookIngest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "webhookId": "lead-ingest-v1"
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * INPUT GUARD — validation + normalization + idempotency key\n * ─────────────────────────────────────────────────────────\n * Fails fast on bad input (invalid email, missing fields).\n * Stamps every item with a stable traceId for log correlation.\n */\n\nconst body = $input.first().json.body ?? $input.first().json;\n\n// ── Validation ────────────────────────────────────────────────────\nconst REQUIRED = ['email', 'firstName', 'lastName'];\nconst missing  = REQUIRED.filter(f => !body[f]?.toString().trim());\nif (missing.length) {\n  throw new Error(`VALIDATION_ERROR: missing required fields [${missing.join(', ')}]`);\n}\n\n// ── Email format check ────────────────────────────────────────────\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst email    = body.email.toLowerCase().trim();\nif (!EMAIL_RE.test(email)) {\n  throw new Error(`VALIDATION_ERROR: invalid email format [${email}]`);\n}\n\n// ── Block free / disposable domains ──────────────────────────────\nconst BLOCKED_DOMAINS = ['mailinator.com','guerrillamail.com','throwaway.email','temp-mail.org'];\nconst domain = email.split('@')[1];\nif (BLOCKED_DOMAINS.includes(domain)) {\n  throw new Error(`VALIDATION_ERROR: disposable email domain [${domain}]`);\n}\n\n// ── Idempotency key (stable per email + source) ───────────────────\nconst crypto = require('crypto');\nconst idempotencyKey = crypto\n  .createHash('sha256')\n  .update(`${email}:${body.source ?? 'unknown'}`)\n  .digest('hex')\n  .slice(0, 16);\n\nconst traceId = `tr-lead-${idempotencyKey}`;\nconst leadId  = `LEAD-${idempotencyKey.toUpperCase()}`;\n\n// ── Canonical lead schema ─────────────────────────────────────────\nreturn [{\n  json: {\n    // Identity\n    traceId,\n    leadId,\n    idempotencyKey,\n\n    // Contact\n    firstName:   body.firstName.trim(),\n    lastName:    body.lastName.trim(),\n    email,\n    domain,\n    phone:       body.phone?.trim()   || null,\n    company:     body.company?.trim() || null,\n    jobTitle:    body.jobTitle?.trim() || null,\n\n    // Attribution\n    source:      body.source     || 'webhook',\n    utmSource:   body.utmSource  || null,\n    utmMedium:   body.utmMedium  || null,\n    utmCampaign: body.utmCampaign || null,\n    pageUrl:     body.pageUrl    || null,\n\n    // Pipeline metadata\n    ingestedAt:  new Date().toISOString(),\n    enrichment:  { clearbit: null, hunter: null },\n    score:       { total: 0, breakdown: {} },\n    tier:        null\n  }\n}];"
+      },
+      "id": "01000000-0000-0000-0000-000000000002",
+      "name": "fn.ValidateAndNormalize",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 400]
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":    "INFO",
+            "workflow": "wf.lead-enrichment",
+            "event":    "lead.ingested",
+            "message":  "=Lead ingested: {{$json.email}}",
+            "traceId":  "={{$json.traceId}}",
+            "data":     "={{ { leadId: $json.leadId, source: $json.source, domain: $json.domain } }}"
+          }
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000003",
+      "name": "log.LeadIngested",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [460, 580]
+    },
+
+    {
+      "parameters": {
+        "url": "https://company.clearbit.com/v2/companies/find",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [{ "name": "domain", "value": "={{$json.domain}}" }]
+        },
+        "options": {
+          "timeout": 12000,
+          "response": { "response": { "fullResponse": true, "responseFormat": "json" } }
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000004",
+      "name": "http.Clearbit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [700, 280],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cred-clearbit",
+          "name": "Clearbit API"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "url": "https://api.hunter.io/v2/email-verifier",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "email",   "value": "={{$json.email}}" },
+            { "name": "api_key", "value": "={{$env.HUNTER_API_KEY}}" }
+          ]
+        },
+        "options": {
+          "timeout": 12000,
+          "response": { "response": { "fullResponse": true, "responseFormat": "json" } }
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000005",
+      "name": "http.Hunter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [700, 500],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * ENRICHMENT MERGE + SCORING ENGINE\n * ──────────────────────────────────────────────────────────────────\n * Defensive merge: treats every enrichment source as optional.\n * Scoring is table-driven — easy to extend without touching logic.\n */\n\nconst items   = $input.all();\nconst lead    = items[0].json;                             // original lead\nconst cbRaw   = items[1]?.json;                            // Clearbit response\nconst hnRaw   = items[2]?.json;                            // Hunter response\n\n// ── Safe extraction helpers ───────────────────────────────────────\nconst cb = (cbRaw?.statusCode >= 200 && cbRaw?.statusCode < 300)\n  ? (cbRaw.body ?? {}) : {};\nconst hn = (hnRaw?.statusCode >= 200 && hnRaw?.statusCode < 300)\n  ? (hnRaw.body?.data ?? {}) : {};\n\n// ── Scoring table ────────────────────────────────────────────────\n// { signal, points, test(lead, cb, hn) → boolean, label }\nconst SCORING_TABLE = [\n  { signal: 'email_verified',   points: 20, label: 'Email verified',      test: (_l,_c,h) => h.status === 'valid' },\n  { signal: 'company_found',    points: 25, label: 'Company data found',   test: (_l,c)   => !!c.name },\n  { signal: 'enterprise',       points: 30, label: 'Enterprise (1000+)',   test: (_l,c)   => (c.metrics?.employees ?? 0) >= 1000 },\n  { signal: 'midmarket',        points: 20, label: 'Mid-market (100-999)', test: (_l,c)   => { const e = c.metrics?.employees ?? 0; return e >= 100 && e < 1000; } },\n  { signal: 'smb',              points: 10, label: 'SMB (10-99)',          test: (_l,c)   => { const e = c.metrics?.employees ?? 0; return e >= 10 && e < 100; } },\n  { signal: 'has_phone',        points: 10, label: 'Phone provided',       test: (l)      => !!l.phone },\n  { signal: 'has_job_title',    points:  5, label: 'Job title provided',   test: (l)      => !!l.jobTitle },\n  { signal: 'tech_stack',       points: 15, label: 'Tech stack detected',  test: (_l,c)   => (c.tech?.length ?? 0) > 0 },\n  { signal: 'has_website',      points:  5, label: 'Website available',    test: (_l,c)   => !!c.domain },\n  { signal: 'paid_source',      points: 10, label: 'Paid acquisition',     test: (l)      => l.utmMedium === 'cpc' || l.utmMedium === 'paid' },\n];\n\nconst breakdown = {};\nlet total = 0;\nfor (const rule of SCORING_TABLE) {\n  const hit = rule.test(lead, cb, hn);\n  breakdown[rule.signal] = { points: hit ? rule.points : 0, label: rule.label, matched: hit };\n  if (hit) total += rule.points;\n}\ntotal = Math.min(total, 100); // cap at 100\n\nconst tier = total >= 65 ? 'HOT' : total >= 40 ? 'WARM' : 'COLD';\n\n// ── Merged enrichment ────────────────────────────────────────────\nconst enriched = {\n  ...lead,\n\n  // Override / fill from enrichment\n  company:          lead.company  || cb.name    || null,\n  companyDomain:    cb.domain     || lead.domain,\n  companySize:      cb.metrics?.employees       || null,\n  companyIndustry:  cb.category?.industry       || null,\n  companySubIndustry: cb.category?.subIndustry  || null,\n  companyCountry:   cb.geo?.country             || null,\n  companyCity:      cb.geo?.city                || null,\n  companyFounded:   cb.foundedYear              || null,\n  companyType:      cb.type                     || null,\n  techStack:        (cb.tech ?? []).slice(0, 8),\n  alexaRank:        cb.metrics?.alexaGlobalRank || null,\n\n  emailStatus:      hn.status     || 'unknown',\n  emailScore:       hn.score      || null,\n\n  enrichment: {\n    clearbitSuccess: !!cb.name,\n    hunterSuccess:   !!hn.status,\n    enrichedAt:      new Date().toISOString()\n  },\n\n  score: { total, breakdown },\n  tier,\n};\n\nreturn [{ json: enriched }];"
+      },
+      "id": "01000000-0000-0000-0000-000000000006",
+      "name": "fn.MergeAndScore",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [940, 400]
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{
+            "value1": "={{$json.tier}}",
+            "operation": "equal",
+            "value2": "COLD"
+          }]
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000007",
+      "name": "gate.RejectCold?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1160, 400]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 200,
+        "responseBody": "={\n  \"status\": \"rejected\",\n  \"reason\": \"lead_score_below_threshold\",\n  \"leadId\": \"{{$json.leadId}}\",\n  \"score\":  {{$json.score.total}},\n  \"tier\":   \"{{$json.tier}}\",\n  \"traceId\": \"{{$json.traceId}}\"\n}"
+      },
+      "id": "01000000-0000-0000-0000-000000000008",
+      "name": "respond.ColdRejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1380, 260]
+    },
+
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.LEADS_SHEET_ID}}",
+        "sheetName":  "leads_v2",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "leadId":            "={{$json.leadId}}",
+            "traceId":           "={{$json.traceId}}",
+            "tier":              "={{$json.tier}}",
+            "scoreTotal":        "={{$json.score.total}}",
+            "firstName":         "={{$json.firstName}}",
+            "lastName":          "={{$json.lastName}}",
+            "email":             "={{$json.email}}",
+            "phone":             "={{$json.phone ?? ''}}",
+            "jobTitle":          "={{$json.jobTitle ?? ''}}",
+            "company":           "={{$json.company ?? ''}}",
+            "companySize":       "={{$json.companySize ?? ''}}",
+            "companyIndustry":   "={{$json.companyIndustry ?? ''}}",
+            "companyCountry":    "={{$json.companyCountry ?? ''}}",
+            "techStack":         "={{$json.techStack.join(', ')}}",
+            "emailStatus":       "={{$json.emailStatus}}",
+            "source":            "={{$json.source}}",
+            "utmSource":         "={{$json.utmSource ?? ''}}",
+            "utmCampaign":       "={{$json.utmCampaign ?? ''}}",
+            "enrichmentSuccess": "={{$json.enrichment.clearbitSuccess && $json.enrichment.hunterSuccess}}",
+            "ingestedAt":        "={{$json.ingestedAt}}",
+            "enrichedAt":        "={{$json.enrichment.enrichedAt}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "01000000-0000-0000-0000-000000000009",
+      "name": "sink.Sheets.StoreLead",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1380, 460],
+      "continueOnFail": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "cred-google-sheets",
+          "name": "Google Sheets — Service Account"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{
+            "value1": "={{$json.tier}}",
+            "operation": "equal",
+            "value2": "HOT"
+          }]
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000010",
+      "name": "gate.IsHot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1600, 460]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// Build rich Slack Block Kit notification for HOT leads\nconst l = $input.first().json;\nconst topSignals = Object.entries(l.score.breakdown)\n  .filter(([, v]) => v.matched)\n  .map(([, v]) => `• ${v.label} (+${v.points})`)\n  .join('\\n');\n\nreturn [{\n  json: {\n    ...l,\n    slackBlocks: [\n      {\n        type: 'header',\n        text: { type: 'plain_text', text: '🔥 HOT LEAD — Immediate Action Required', emoji: true }\n      },\n      {\n        type: 'section',\n        fields: [\n          { type: 'mrkdwn', text: `*Name:*\\n${l.firstName} ${l.lastName}` },\n          { type: 'mrkdwn', text: `*Email:*\\n${l.email}` },\n          { type: 'mrkdwn', text: `*Company:*\\n${l.company ?? 'Unknown'}` },\n          { type: 'mrkdwn', text: `*Industry:*\\n${l.companyIndustry ?? 'N/A'}` },\n          { type: 'mrkdwn', text: `*Company Size:*\\n${l.companySize ? l.companySize + ' employees' : 'Unknown'}` },\n          { type: 'mrkdwn', text: `*Score:*\\n${l.score.total}/100 — ${l.tier}` }\n        ]\n      },\n      {\n        type: 'section',\n        text: { type: 'mrkdwn', text: `*Scoring Signals Matched:*\\n${topSignals || 'None'}` }\n      },\n      {\n        type: 'context',\n        elements: [\n          { type: 'mrkdwn', text: `Lead ID: \\`${l.leadId}\\` | Trace: \\`${l.traceId}\\` | Source: ${l.source}` }\n        ]\n      },\n      { type: 'divider' }\n    ]\n  }\n}];"
+      },
+      "id": "01000000-0000-0000-0000-000000000011",
+      "name": "fn.BuildHotSlackMsg",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1820, 360]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// Build concise Slack Block Kit notification for WARM leads\nconst l = $input.first().json;\nreturn [{\n  json: {\n    ...l,\n    slackBlocks: [\n      {\n        type: 'section',\n        text: { type: 'mrkdwn', text: `📊 *WARM Lead* — Follow up within 48h\\n*${l.firstName} ${l.lastName}* | ${l.email} | ${l.company ?? 'Unknown company'}\\nScore: ${l.score.total}/100 | LeadID: \\`${l.leadId}\\`` }\n      }\n    ]\n  }\n}];"
+      },
+      "id": "01000000-0000-0000-0000-000000000012",
+      "name": "fn.BuildWarmSlackMsg",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1820, 560]
+    },
+
+    {
+      "parameters": {
+        "channel":  "#sales-hot-leads",
+        "blocksUi": { "blocksValues": "={{$json.slackBlocks}}" },
+        "text":     "=🔥 HOT LEAD: {{$json.firstName}} {{$json.lastName}} ({{$json.email}}) — Score {{$json.score.total}}/100",
+        "otherOptions": {}
+      },
+      "id": "01000000-0000-0000-0000-000000000013",
+      "name": "notify.Slack.Hot",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2040, 360],
+      "continueOnFail": true,
+      "credentials": {
+        "slackApi": {
+          "id": "cred-slack",
+          "name": "Slack — Automation Bot"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "channel":  "#sales-pipeline",
+        "blocksUi": { "blocksValues": "={{$json.slackBlocks}}" },
+        "text":     "=📊 WARM LEAD: {{$json.firstName}} {{$json.lastName}} — Score {{$json.score.total}}/100",
+        "otherOptions": {}
+      },
+      "id": "01000000-0000-0000-0000-000000000014",
+      "name": "notify.Slack.Warm",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2040, 560],
+      "continueOnFail": true,
+      "credentials": {
+        "slackApi": {
+          "id": "cred-slack",
+          "name": "Slack — Automation Bot"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":      "INFO",
+            "workflow":   "wf.lead-enrichment",
+            "event":      "lead.qualified",
+            "message":    "=Lead qualified: {{$json.email}} tier={{$json.tier}} score={{$json.score.total}}",
+            "traceId":    "={{$json.traceId}}",
+            "data":       "={{ { leadId: $json.leadId, tier: $json.tier, score: $json.score.total, enrichment: $json.enrichment } }}",
+            "durationMs": "={{ Date.now() - new Date($json.ingestedAt).getTime() }}"
+          }
+        }
+      },
+      "id": "01000000-0000-0000-0000-000000000015",
+      "name": "log.LeadQualified",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2040, 740]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 201,
+        "responseBody": "={\n  \"status\":  \"accepted\",\n  \"leadId\":  \"{{$json.leadId}}\",\n  \"tier\":    \"{{$json.tier}}\",\n  \"score\":   {{$json.score.total}},\n  \"traceId\": \"{{$json.traceId}}\"\n}"
+      },
+      "id": "01000000-0000-0000-0000-000000000016",
+      "name": "respond.Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1380, 700]
+    }
+  ],
+
+  "connections": {
+    "trigger.WebhookIngest":    { "main": [[{ "node": "fn.ValidateAndNormalize", "type": "main", "index": 0 }]] },
+    "fn.ValidateAndNormalize":  { "main": [[
+      { "node": "http.Clearbit",      "type": "main", "index": 0 },
+      { "node": "http.Hunter",        "type": "main", "index": 0 },
+      { "node": "log.LeadIngested",   "type": "main", "index": 0 }
+    ]] },
+    "http.Clearbit":            { "main": [[{ "node": "fn.MergeAndScore", "type": "main", "index": 0 }]] },
+    "http.Hunter":              { "main": [[{ "node": "fn.MergeAndScore", "type": "main", "index": 0 }]] },
+    "fn.MergeAndScore":         { "main": [[{ "node": "gate.RejectCold?",  "type": "main", "index": 0 }]] },
+    "gate.RejectCold?": {
+      "main": [
+        [{ "node": "respond.ColdRejected", "type": "main", "index": 0 }],
+        [{ "node": "sink.Sheets.StoreLead", "type": "main", "index": 0 }, { "node": "respond.Accepted", "type": "main", "index": 0 }]
+      ]
+    },
+    "sink.Sheets.StoreLead":    { "main": [[{ "node": "gate.IsHot?", "type": "main", "index": 0 }]] },
+    "gate.IsHot?": {
+      "main": [
+        [{ "node": "fn.BuildHotSlackMsg",  "type": "main", "index": 0 }],
+        [{ "node": "fn.BuildWarmSlackMsg", "type": "main", "index": 0 }]
+      ]
+    },
+    "fn.BuildHotSlackMsg":      { "main": [[{ "node": "notify.Slack.Hot",     "type": "main", "index": 0 }]] },
+    "fn.BuildWarmSlackMsg":     { "main": [[{ "node": "notify.Slack.Warm",    "type": "main", "index": 0 }]] },
+    "notify.Slack.Hot":         { "main": [[{ "node": "log.LeadQualified",    "type": "main", "index": 0 }]] },
+    "notify.Slack.Warm":        { "main": [[{ "node": "log.LeadQualified",    "type": "main", "index": 0 }]] }
+  },
+
+  "settings": {
+    "errorWorkflow":            "[SHARED] Global Error Handler",
+    "saveDataErrorExecution":   "all",
+    "saveDataSuccessExecution": "last",
+    "saveManualExecutions":     true,
+    "callerPolicy":             "workflowsFromSameOwner",
+    "executionOrder":           "v1"
+  },
+  "staticData": null,
+  "tags": ["lead-gen", "enrichment", "sales", "v2", "production"],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "v2.0.0"
+}

@@ -1,0 +1,248 @@
+{
+  "name": "wf.support-ticket-classifier",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod":   "POST",
+        "path":         "v1/support/tickets",
+        "responseMode": "responseNode",
+        "options":      {}
+      },
+      "id": "04000000-0000-0000-0000-000000000001",
+      "name": "trigger.WebhookTicket",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "webhookId": "support-tickets-v1"
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * TICKET NORMALISER\n * ──────────────────────────────────────────────────────────────────\n * Accepts payloads from: direct form, Zendesk, Intercom, Freshdesk.\n * Stamps urgency pre-signal for AI context injection.\n */\n\nconst raw = $input.first().json.body ?? $input.first().json;\n\n// ── Field normalisation ────────────────────────────────────────────\nconst subject = (raw.subject ?? raw.title ?? '').trim();\nconst body    = (raw.body ?? raw.description ?? raw.message ?? '').trim();\nconst combined = `${subject} ${body}`.toLowerCase();\n\n// ── Deterministic pre-signals (seeded into AI prompt) ─────────────\nconst PRE_SIGNALS = {\n  hasUrgencyKeyword:  /urgent|critical|down|broken|emergency|asap|immediately|not working|crashed|data loss|outage/i.test(combined),\n  hasLegalKeyword:    /lawsuit|attorney|legal action|sue|chargeback|fraud|gdpr|data breach/i.test(combined),\n  hasBillingKeyword:  /invoice|charge|payment|refund|subscription|billing|overcharged/i.test(combined),\n  hasSecurityKeyword: /hacked|compromised|unauthorized|breach|vulnerability|exploit/i.test(combined)\n};\n\nconst traceId  = `tr-ticket-${Date.now().toString(36)}`;\nconst ticketId = raw.ticketId ?? raw.id ?? `TKT-${Date.now()}`;\n\nreturn [{\n  json: {\n    traceId,\n    ticketId,\n    subject,\n    body:          body.length > 3000 ? body.slice(0, 3000) + '…' : body,\n    customerEmail: (raw.email ?? raw.customerEmail ?? '').toLowerCase().trim(),\n    customerName:  raw.name  ?? raw.customerName  ?? 'Customer',\n    source:        raw.source ?? 'webhook',\n    preSignals:    PRE_SIGNALS,\n    metadata: {\n      accountId: raw.accountId ?? null,\n      planType:  raw.planType  ?? 'unknown',\n      userAgent: raw.userAgent ?? null\n    },\n    submittedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "04000000-0000-0000-0000-000000000002",
+      "name": "fn.NormaliseTicket",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 400]
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert support ticket classification engine used at a high-scale SaaS company.\nReturn ONLY a valid JSON object — no markdown, no explanation.\n\nSchema:\n{\n  \"category\":             \"technical_bug|billing|account|feature_request|security|data_issue|onboarding|general\",\n  \"subcategory\":          \"string\",\n  \"priority\":             \"P1_critical|P2_high|P3_medium|P4_low\",\n  \"sla_minutes\":          number,\n  \"sentiment\":            \"very_negative|negative|neutral|positive\",\n  \"frustrationScore\":     0-10,\n  \"assignedTeam\":         \"engineering|billing_ops|customer_success|security|product|general_support\",\n  \"escalate\":             true|false,\n  \"escalationReason\":     \"string|null\",\n  \"keyIssues\":            [\"string\"],\n  \"suggestedFirstResponse\": \"string\",\n  \"confidence\":           0.0-1.0\n}\n\nPriority + SLA rules:\n  P1_critical (sla: 15 min):  system-wide outage, data loss, active security breach, production broken\n  P2_high     (sla: 60 min):  feature broken, enterprise customer blocked, payment failure\n  P3_medium   (sla: 240 min): non-critical bug, general question, minor inconvenience\n  P4_low      (sla: 1440 min): feature request, docs question, general feedback\n\nescalate = true when: P1 OR (P2 AND enterprise plan) OR security keyword OR legal keyword OR frustrationScore >= 8\n\nReturn ONLY the JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Classify this ticket:\n\nTicket ID: {{$json.ticketId}}\nCustomer: {{$json.customerName}} ({{$json.customerEmail}})\nPlan: {{$json.metadata.planType}}\n\nPre-signals detected:\n- Urgency keyword: {{$json.preSignals.hasUrgencyKeyword}}\n- Legal language: {{$json.preSignals.hasLegalKeyword}}\n- Billing language: {{$json.preSignals.hasBillingKeyword}}\n- Security language: {{$json.preSignals.hasSecurityKeyword}}\n\nSubject: {{$json.subject}}\n\nBody:\n{{$json.body}}"
+            }
+          ]
+        },
+        "options": { "temperature": 0.05, "maxTokens": 600 }
+      },
+      "id": "04000000-0000-0000-0000-000000000003",
+      "name": "ai.ClassifyTicket",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "openAiApi": { "id": "cred-openai", "name": "OpenAI API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * CLASSIFICATION ENRICHER + BUSINESS RULE ENFORCEMENT\n * ──────────────────────────────────────────────────────────────────\n * Defensive JSON parse → apply deterministic overrides → validate output.\n * Business rules always supersede AI — this is the safety guarantee.\n */\n\nconst ticket = $input.all()[0].json;\nconst aiText = $input.all()[1]?.json?.message?.content ?? '{}';\n\n// ── Safe parse ────────────────────────────────────────────────────\nlet cls;\ntry {\n  cls = JSON.parse(aiText.replace(/```json|```/g, '').trim());\n} catch (_e) {\n  cls = {\n    category: 'general', subcategory: 'unclassified',\n    priority: 'P3_medium', sla_minutes: 240,\n    sentiment: 'neutral', frustrationScore: 5,\n    assignedTeam: 'general_support',\n    escalate: true, escalationReason: 'AI_PARSE_FAILURE',\n    keyIssues: ['Classification failed'], suggestedFirstResponse: 'Thank you for reaching out. We are reviewing your ticket.',\n    confidence: 0.0\n  };\n}\n\n// ── Deterministic enforcement rules ──────────────────────────────\nconst p = ticket.preSignals;\nconst plan = ticket.metadata.planType?.toLowerCase();\n\n// Security trumps everything\nif (p.hasSecurityKeyword) {\n  cls.priority       = 'P1_critical';\n  cls.sla_minutes    = 15;\n  cls.assignedTeam   = 'security';\n  cls.escalate       = true;\n  cls.escalationReason = 'SECURITY_KEYWORD_DETECTED';\n}\n// Legal language forces review\nif (p.hasLegalKeyword) {\n  cls.escalate       = true;\n  cls.escalationReason = cls.escalationReason ?? 'LEGAL_LANGUAGE_DETECTED';\n  if (!['P1_critical','P2_high'].includes(cls.priority)) {\n    cls.priority     = 'P2_high';\n    cls.sla_minutes  = 60;\n  }\n}\n// Urgency keyword floors at P2\nif (p.hasUrgencyKeyword && !['P1_critical','P2_high'].includes(cls.priority)) {\n  cls.priority       = 'P2_high';\n  cls.sla_minutes    = 60;\n  cls.escalationReason = cls.escalationReason ?? 'URGENCY_KEYWORD_DETECTED';\n}\n// Enterprise P1/P2 always escalates\nif (['enterprise','enterprise_plus'].includes(plan) && ['P1_critical','P2_high'].includes(cls.priority)) {\n  cls.escalate       = true;\n  cls.escalationReason = cls.escalationReason ?? `ENTERPRISE_${cls.priority}`;\n}\n\n// ── SLA deadline ──────────────────────────────────────────────────\nconst slaDeadline = new Date(Date.now() + cls.sla_minutes * 60 * 1000).toISOString();\n\nreturn [{\n  json: {\n    ...ticket,\n    classification: cls,\n    slaDeadline,\n    routingKey: `${cls.assignedTeam}::${cls.priority}`\n  }\n}];"
+      },
+      "id": "04000000-0000-0000-0000-000000000004",
+      "name": "fn.EnrichAndEnforce",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 400]
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.classification.priority}}", "operation": "equal", "value2": "P1_critical" }]
+        }
+      },
+      "id": "04000000-0000-0000-0000-000000000005",
+      "name": "gate.IsP1?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 280]
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.classification.priority}}", "operation": "equal", "value2": "P2_high" }]
+        }
+      },
+      "id": "04000000-0000-0000-0000-000000000006",
+      "name": "gate.IsP2?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 520]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// P1 Slack Block Kit — oncall pager-level alert\nconst t = $input.first().json;\nconst c = t.classification;\nreturn [{\n  json: {\n    ...t,\n    slackBlocks: [\n      { type: 'header', text: { type: 'plain_text', text: '🚨 P1 CRITICAL — IMMEDIATE RESPONSE REQUIRED', emoji: true } },\n      {\n        type: 'section',\n        fields: [\n          { type: 'mrkdwn', text: `*Ticket:*\\n\\`${t.ticketId}\\`` },\n          { type: 'mrkdwn', text: `*Customer:*\\n${t.customerName}` },\n          { type: 'mrkdwn', text: `*Plan:*\\n${t.metadata.planType}` },\n          { type: 'mrkdwn', text: `*SLA Deadline:*\\n${t.slaDeadline}` },\n          { type: 'mrkdwn', text: `*Category:*\\n${c.category} / ${c.subcategory}` },\n          { type: 'mrkdwn', text: `*Team:*\\n${c.assignedTeam}` }\n        ]\n      },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Subject:*\\n${t.subject}` } },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Key Issues:*\\n${c.keyIssues.map(i => `• ${i}`).join('\\n')}` } },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Escalation Reason:*\\n${c.escalationReason ?? 'None'}` } },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Suggested First Response:*\\n${c.suggestedFirstResponse}` } },\n      { type: 'context', elements: [{ type: 'mrkdwn', text: `Trace: \\`${t.traceId}\\` | Frustration: ${c.frustrationScore}/10 | Confidence: ${(c.confidence * 100).toFixed(0)}%` }] },\n      { type: 'divider' }\n    ],\n    slackChannel: '#oncall-p1-alerts'\n  }\n}];"
+      },
+      "id": "04000000-0000-0000-0000-000000000007",
+      "name": "fn.BuildP1Alert",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 180]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// P2+ Slack Block Kit — team channel alert\nconst t = $input.first().json;\nconst c = t.classification;\nconst EMOJI = { P2_high: '🔴', P3_medium: '🟡', P4_low: '🟢' };\nreturn [{\n  json: {\n    ...t,\n    slackBlocks: [\n      {\n        type: 'section',\n        text: { type: 'mrkdwn', text: `${EMOJI[c.priority] ?? '📋'} *${c.priority} Ticket* — ${c.category}/${c.subcategory}\\n*${t.customerName}* (${t.customerEmail}) | Plan: ${t.metadata.planType}\\nSLA: ${t.slaDeadline}` }\n      },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Subject:* ${t.subject}\\n*Issues:* ${c.keyIssues.join(' · ')}` } },\n      { type: 'context', elements: [{ type: 'mrkdwn', text: `Ticket: \\`${t.ticketId}\\` | Team: ${c.assignedTeam} | Trace: \\`${t.traceId}\\`` }] }\n    ],\n    slackChannel: `#support-${c.assignedTeam.replace('_', '-')}`\n  }\n}];"
+      },
+      "id": "04000000-0000-0000-0000-000000000008",
+      "name": "fn.BuildTeamAlert",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 460]
+    },
+
+    {
+      "parameters": {
+        "channel":  "={{$json.slackChannel}}",
+        "blocksUi": { "blocksValues": "={{$json.slackBlocks}}" },
+        "text":     "=🚨 P1 CRITICAL: {{$json.ticketId}} — {{$json.subject}}",
+        "otherOptions": { "username": "Support Triage Bot", "icon_emoji": ":rotating_light:" }
+      },
+      "id": "04000000-0000-0000-0000-000000000009",
+      "name": "notify.Slack.P1",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1560, 180],
+      "continueOnFail": true,
+      "credentials": { "slackApi": { "id": "cred-slack", "name": "Slack — Automation Bot" } }
+    },
+
+    {
+      "parameters": {
+        "channel":  "={{$json.slackChannel}}",
+        "blocksUi": { "blocksValues": "={{$json.slackBlocks}}" },
+        "text":     "={{$json.classification.priority}} Ticket: {{$json.ticketId}} — {{$json.subject}}",
+        "otherOptions": {}
+      },
+      "id": "04000000-0000-0000-0000-000000000010",
+      "name": "notify.Slack.Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1560, 460],
+      "continueOnFail": true,
+      "credentials": { "slackApi": { "id": "cred-slack", "name": "Slack — Automation Bot" } }
+    },
+
+    {
+      "parameters": {
+        "url": "https://api.notion.com/v1/pages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"parent\": { \"database_id\": \"{{$env.NOTION_TICKETS_DB_ID}}\" },\n  \"properties\": {\n    \"Ticket ID\":         { \"title\":     [{ \"text\": { \"content\": \"{{$json.ticketId}}\" } }] },\n    \"Subject\":           { \"rich_text\": [{ \"text\": { \"content\": \"{{$json.subject}}\" } }] },\n    \"Customer Email\":    { \"email\":     \"{{$json.customerEmail}}\" },\n    \"Customer Name\":     { \"rich_text\": [{ \"text\": { \"content\": \"{{$json.customerName}}\" } }] },\n    \"Category\":          { \"select\":    { \"name\": \"{{$json.classification.category}}\" } },\n    \"Subcategory\":       { \"rich_text\": [{ \"text\": { \"content\": \"{{$json.classification.subcategory}}\" } }] },\n    \"Priority\":          { \"select\":    { \"name\": \"{{$json.classification.priority}}\" } },\n    \"Assigned Team\":     { \"select\":    { \"name\": \"{{$json.classification.assignedTeam}}\" } },\n    \"Status\":            { \"select\":    { \"name\": \"Open\" } },\n    \"Sentiment\":         { \"select\":    { \"name\": \"{{$json.classification.sentiment}}\" } },\n    \"Frustration Score\": { \"number\":    {{$json.classification.frustrationScore}} },\n    \"Plan Type\":         { \"select\":    { \"name\": \"{{$json.metadata.planType}}\" } },\n    \"Source\":            { \"select\":    { \"name\": \"{{$json.source}}\" } },\n    \"Escalate\":          { \"checkbox\":  {{$json.classification.escalate}} },\n    \"SLA Deadline\":      { \"date\":      { \"start\": \"{{$json.slaDeadline}}\" } },\n    \"Submitted At\":      { \"date\":      { \"start\": \"{{$json.submittedAt}}\" } },\n    \"AI Confidence\":     { \"number\":    {{$json.classification.confidence}} },\n    \"Trace ID\":          { \"rich_text\": [{ \"text\": { \"content\": \"{{$json.traceId}}\" } }] }\n  },\n  \"children\": [\n    { \"object\": \"block\", \"type\": \"heading_2\", \"heading_2\": { \"rich_text\": [{ \"text\": { \"content\": \"Customer Message\" } }] } },\n    { \"object\": \"block\", \"type\": \"paragraph\", \"paragraph\": { \"rich_text\": [{ \"text\": { \"content\": \"{{$json.body.slice(0,1900)}}\" } }] } },\n    { \"object\": \"block\", \"type\": \"heading_2\", \"heading_2\": { \"rich_text\": [{ \"text\": { \"content\": \"AI Triage Analysis\" } }] } },\n    { \"object\": \"block\", \"type\": \"paragraph\", \"paragraph\": { \"rich_text\": [{ \"text\": { \"content\": \"Key Issues: {{$json.classification.keyIssues.join(', ')}}\\n\\nSuggested First Response:\\n{{$json.classification.suggestedFirstResponse}}\\n\\nEscalation Reason: {{$json.classification.escalationReason ?? 'None'}}\" } }] } }\n  ]\n}",
+        "options": { "timeout": 20000 }
+      },
+      "id": "04000000-0000-0000-0000-000000000011",
+      "name": "sink.Notion.CreateTicket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1780, 400],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-notion", "name": "Notion API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":    "=={{$json.classification.priority === 'P1_critical' ? 'WARN' : 'INFO'}}",
+            "workflow": "wf.support-ticket-classifier",
+            "event":    "ticket.classified",
+            "message":  "=Ticket {{$json.ticketId}} classified: {{$json.classification.priority}} / {{$json.classification.category}} → {{$json.classification.assignedTeam}}",
+            "traceId":  "={{$json.traceId}}",
+            "data":     "={{ { ticketId: $json.ticketId, priority: $json.classification.priority, category: $json.classification.category, team: $json.classification.assignedTeam, escalate: $json.classification.escalate, slaDeadline: $json.slaDeadline } }}"
+          }
+        }
+      },
+      "id": "04000000-0000-0000-0000-000000000012",
+      "name": "log.TicketClassified",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1780, 600]
+    },
+
+    {
+      "parameters": {
+        "respondWith":  "json",
+        "responseCode": 201,
+        "responseBody": "={\n  \"status\":      \"created\",\n  \"ticketId\":    \"{{$json.ticketId}}\",\n  \"traceId\":     \"{{$json.traceId}}\",\n  \"priority\":    \"{{$json.classification.priority}}\",\n  \"category\":    \"{{$json.classification.category}}\",\n  \"assignedTeam\": \"{{$json.classification.assignedTeam}}\",\n  \"slaDeadline\": \"{{$json.slaDeadline}}\",\n  \"escalate\":    {{$json.classification.escalate}}\n}"
+      },
+      "id": "04000000-0000-0000-0000-000000000013",
+      "name": "respond.TicketCreated",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2000, 400]
+    }
+  ],
+
+  "connections": {
+    "trigger.WebhookTicket":    { "main": [[{ "node": "fn.NormaliseTicket",       "type": "main", "index": 0 }]] },
+    "fn.NormaliseTicket":       { "main": [[{ "node": "ai.ClassifyTicket",        "type": "main", "index": 0 }]] },
+    "ai.ClassifyTicket":        { "main": [[{ "node": "fn.EnrichAndEnforce",      "type": "main", "index": 0 }]] },
+    "fn.EnrichAndEnforce":      { "main": [[{ "node": "gate.IsP1?",               "type": "main", "index": 0 }]] },
+    "gate.IsP1?": {
+      "main": [
+        [{ "node": "fn.BuildP1Alert",   "type": "main", "index": 0 }],
+        [{ "node": "gate.IsP2?",        "type": "main", "index": 0 }]
+      ]
+    },
+    "gate.IsP2?": {
+      "main": [
+        [{ "node": "fn.BuildTeamAlert", "type": "main", "index": 0 }],
+        [{ "node": "fn.BuildTeamAlert", "type": "main", "index": 0 }]
+      ]
+    },
+    "fn.BuildP1Alert":          { "main": [[{ "node": "notify.Slack.P1",          "type": "main", "index": 0 }]] },
+    "fn.BuildTeamAlert":        { "main": [[{ "node": "notify.Slack.Team",        "type": "main", "index": 0 }]] },
+    "notify.Slack.P1":          { "main": [[{ "node": "sink.Notion.CreateTicket", "type": "main", "index": 0 }]] },
+    "notify.Slack.Team":        { "main": [[{ "node": "sink.Notion.CreateTicket", "type": "main", "index": 0 }]] },
+    "sink.Notion.CreateTicket": { "main": [[
+      { "node": "log.TicketClassified", "type": "main", "index": 0 },
+      { "node": "respond.TicketCreated","type": "main", "index": 0 }
+    ]] }
+  },
+
+  "settings": {
+    "errorWorkflow":            "[SHARED] Global Error Handler",
+    "saveDataErrorExecution":   "all",
+    "saveDataSuccessExecution": "last",
+    "saveManualExecutions":     true,
+    "executionOrder":           "v1"
+  },
+  "staticData": null,
+  "tags": ["support", "tickets", "ai", "openai", "notion", "v2", "production"],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "v2.0.0"
+}

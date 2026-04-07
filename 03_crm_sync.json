@@ -1,0 +1,249 @@
+{
+  "name": "wf.crm-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod":   "POST",
+        "path":         "v1/crm/events",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      },
+      "id": "03000000-0000-0000-0000-000000000001",
+      "name": "trigger.WebhookCrmEvent",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "webhookId": "crm-events-v1"
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * SECURITY GATE — HMAC-SHA256 webhook signature verification\n * ──────────────────────────────────────────────────────────────────\n * Rejects any request whose x-webhook-signature header does\n * not match HMAC-SHA256(secret, rawBody).\n * Fails closed: missing signature = rejected.\n */\n\nconst crypto  = require('crypto');\nconst item    = $input.first().json;\nconst headers = item.headers ?? {};\nconst rawBody = item.rawBody  ?? JSON.stringify(item.body ?? item);\n\nconst secret    = process.env.WEBHOOK_SECRET;\nconst sigHeader = headers['x-webhook-signature'] ?? headers['x-hub-signature-256'] ?? '';\n\nif (!secret) throw new Error('SECURITY_ERROR: WEBHOOK_SECRET env var not set');\nif (!sigHeader) throw new Error('AUTH_ERROR: missing x-webhook-signature header');\n\nconst expected  = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nconst sigBuffer = Buffer.from(sigHeader);\nconst expBuffer = Buffer.from(expected);\n\n// Constant-time comparison to prevent timing attacks\nif (sigBuffer.length !== expBuffer.length || !crypto.timingSafeEqual(sigBuffer, expBuffer)) {\n  throw new Error(`AUTH_ERROR: invalid webhook signature`);\n}\n\n// ── Parse body ─────────────────────────────────────────────────────\nconst body = item.body ?? item;\n\n// ── Event type normalisation ───────────────────────────────────────\nconst EVENT_MAP = {\n  'contact.created': 'CONTACT_NEW',\n  'contact.updated': 'CONTACT_UPDATE',\n  'contact.deleted': 'CONTACT_DELETE',\n  'deal.created':    'DEAL_NEW',\n  'deal.updated':    'DEAL_UPDATE',\n  'deal.won':        'DEAL_WON',\n  'company.created': 'COMPANY_NEW'\n};\n\nconst eventType = EVENT_MAP[body.event] ?? body.eventType ?? null;\nif (!eventType) throw new Error(`VALIDATION_ERROR: unknown event type [${body.event}]`);\n\n// ── Build canonical contact ────────────────────────────────────────\nconst src = body.contact ?? body.data ?? body;\nconst email = (src.email ?? '').toLowerCase().trim();\nif (!email) throw new Error('VALIDATION_ERROR: contact.email is required');\n\nconst traceId = `tr-crm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;\n\nreturn [{\n  json: {\n    traceId,\n    syncId:       `SYNC-${traceId}`,\n    eventType,\n    sourceSystem: body.source ?? headers['x-source-system'] ?? 'unknown',\n    receivedAt:   new Date().toISOString(),\n\n    contact: {\n      externalId:     src.id          ?? src.contactId   ?? null,\n      email,\n      firstName:      src.firstName   ?? src.first_name  ?? '',\n      lastName:       src.lastName    ?? src.last_name   ?? '',\n      phone:          src.phone       ?? src.phoneNumber ?? null,\n      company:        src.company     ?? src.companyName ?? null,\n      jobTitle:       src.jobTitle    ?? src.job_title   ?? null,\n      website:        src.website     ?? null,\n      lifecycleStage: src.lifecycleStage ?? src.lifecycle_stage ?? 'lead',\n      leadStatus:     src.leadStatus  ?? src.lead_status  ?? 'new',\n      country:        src.country     ?? src.address?.country ?? null,\n      city:           src.city        ?? src.address?.city    ?? null,\n      customFields:   src.customFields ?? src.custom_fields   ?? {}\n    },\n\n    deal: body.deal ? {\n      dealId:    body.deal.id,\n      dealName:  body.deal.name,\n      amount:    body.deal.amount    ?? 0,\n      stage:     body.deal.stage     ?? 'prospecting',\n      closeDate: body.deal.closeDate ?? null,\n      currency:  body.deal.currency  ?? 'USD'\n    } : null,\n\n    // Sync state tracking\n    destinations: { hubspot: 'pending', sheets: 'pending' },\n    errors:       []\n  }\n}];"
+      },
+      "id": "03000000-0000-0000-0000-000000000002",
+      "name": "fn.AuthAndNormalise",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 400]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * HUBSPOT PAYLOAD TRANSFORMER\n * ──────────────────────────────────────────────────────────────────\n * Maps canonical contact schema → HubSpot CRM v3 properties.\n * Strips nulls (HubSpot rejects null values).\n * Determines PATCH vs POST based on externalId presence.\n */\n\nconst d = $input.first().json;\nconst c = d.contact;\n\nconst props = {\n  email:              c.email,\n  firstname:          c.firstName        || undefined,\n  lastname:           c.lastName         || undefined,\n  phone:              c.phone            || undefined,\n  company:            c.company          || undefined,\n  jobtitle:           c.jobTitle         || undefined,\n  website:            c.website          || undefined,\n  lifecyclestage:     c.lifecycleStage,\n  hs_lead_status:     c.leadStatus?.toUpperCase() || undefined,\n  country:            c.country          || undefined,\n  city:               c.city             || undefined,\n  // Audit trail properties (configure these in your HubSpot portal)\n  n8n_trace_id:       d.traceId,\n  n8n_sync_id:        d.syncId,\n  n8n_source_system:  d.sourceSystem,\n  n8n_synced_at:      d.receivedAt\n};\n\n// Remove undefined values\nconst cleanProps = Object.fromEntries(\n  Object.entries(props).filter(([, v]) => v !== undefined && v !== null)\n);\n\nconst isUpdate   = !!c.externalId;\nconst endpoint   = isUpdate\n  ? `/crm/v3/objects/contacts/${c.externalId}`\n  : '/crm/v3/objects/contacts';\nconst httpMethod = isUpdate ? 'PATCH' : 'POST';\n\nreturn [{\n  json: {\n    ...d,\n    hubspot: {\n      endpoint,\n      method:  httpMethod,\n      payload: { properties: cleanProps }\n    }\n  }\n}];"
+      },
+      "id": "03000000-0000-0000-0000-000000000003",
+      "name": "fn.TransformForHubSpot",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 280]
+    },
+
+    {
+      "parameters": {
+        "url":    "=https://api.hubapi.com{{$json.hubspot.endpoint}}",
+        "method": "={{$json.hubspot.method}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody":    true,
+        "contentType": "json",
+        "body": "={{JSON.stringify($json.hubspot.payload)}}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": { "fullResponse": true, "responseFormat": "json" }
+          }
+        }
+      },
+      "id": "03000000-0000-0000-0000-000000000004",
+      "name": "http.HubSpotUpsert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [900, 280],
+      "continueOnFail": true,
+      "retryOnFail":    true,
+      "maxTries":       4,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-hubspot", "name": "HubSpot — Private App" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * HUBSPOT RESULT EVALUATOR\n * ──────────────────────────────────────────────────────────────────\n * Inspects the HTTP response and either:\n *  a) Attaches the HubSpot contact ID and marks success, or\n *  b) Records a structured error and marks failure.\n *\n * Tolerates 409 CONFLICT (contact already exists) as a soft success\n * — this is idempotent behaviour when the same contact arrives twice.\n */\n\nconst d          = $input.first().json;\nconst statusCode = d.statusCode ?? 0;\nconst body       = d.body ?? {};\n\nconst isSuccess  = statusCode >= 200 && statusCode <= 299;\nconst isConflict = statusCode === 409; // duplicate — treat as soft success\n\nif (isSuccess || isConflict) {\n  return [{\n    json: {\n      ...d,\n      destinations: { ...d.destinations, hubspot: 'success' },\n      hubspotContactId: body.id ?? body.vid ?? d.contact.externalId ?? null,\n      hubspotStatus: isConflict ? 'existed' : 'created_or_updated'\n    }\n  }];\n} else {\n  const errDetail = {\n    destination: 'hubspot',\n    statusCode,\n    message: body.message ?? body.error ?? 'unknown error',\n    category: body.category ?? null\n  };\n  return [{\n    json: {\n      ...d,\n      destinations: { ...d.destinations, hubspot: 'failed' },\n      errors: [...(d.errors ?? []), errDetail]\n    }\n  }];\n}"
+      },
+      "id": "03000000-0000-0000-0000-000000000005",
+      "name": "fn.EvaluateHubSpotResult",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 280]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * GOOGLE SHEETS PAYLOAD TRANSFORMER\n * ──────────────────────────────────────────────────────────────────\n * Flattens nested canonical schema into a flat row object\n * suitable for upsert (matched on email column).\n */\n\nconst d = $input.first().json;\nconst c = d.contact;\n\nreturn [{\n  json: {\n    ...d,\n    sheetsRow: {\n      syncId:            d.syncId,\n      traceId:           d.traceId,\n      eventType:         d.eventType,\n      sourceSystem:      d.sourceSystem,\n      email:             c.email,\n      firstName:         c.firstName       ?? '',\n      lastName:          c.lastName        ?? '',\n      phone:             c.phone           ?? '',\n      company:           c.company         ?? '',\n      jobTitle:          c.jobTitle        ?? '',\n      lifecycleStage:    c.lifecycleStage  ?? '',\n      leadStatus:        c.leadStatus      ?? '',\n      country:           c.country         ?? '',\n      city:              c.city            ?? '',\n      hubspotId:         d.hubspotContactId ?? '',\n      hubspotStatus:     d.destinations.hubspot,\n      dealName:          d.deal?.dealName  ?? '',\n      dealAmount:        d.deal?.amount    ?? '',\n      dealStage:         d.deal?.stage     ?? '',\n      receivedAt:        d.receivedAt,\n      lastSyncedAt:      new Date().toISOString(),\n      hasErrors:         d.errors.length > 0,\n      errorSummary:      d.errors.length > 0 ? JSON.stringify(d.errors) : ''\n    }\n  }\n}];"
+      },
+      "id": "03000000-0000-0000-0000-000000000006",
+      "name": "fn.TransformForSheets",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 400]
+    },
+
+    {
+      "parameters": {
+        "operation":    "upsert",
+        "documentId":   "={{$env.CRM_SHEET_ID}}",
+        "sheetName":    "contacts",
+        "columns": {
+          "mappingMode":    "defineBelow",
+          "matchingColumns": ["email"],
+          "value": {
+            "syncId":         "={{$json.sheetsRow.syncId}}",
+            "traceId":        "={{$json.sheetsRow.traceId}}",
+            "eventType":      "={{$json.sheetsRow.eventType}}",
+            "sourceSystem":   "={{$json.sheetsRow.sourceSystem}}",
+            "email":          "={{$json.sheetsRow.email}}",
+            "firstName":      "={{$json.sheetsRow.firstName}}",
+            "lastName":       "={{$json.sheetsRow.lastName}}",
+            "phone":          "={{$json.sheetsRow.phone}}",
+            "company":        "={{$json.sheetsRow.company}}",
+            "jobTitle":       "={{$json.sheetsRow.jobTitle}}",
+            "lifecycleStage": "={{$json.sheetsRow.lifecycleStage}}",
+            "leadStatus":     "={{$json.sheetsRow.leadStatus}}",
+            "country":        "={{$json.sheetsRow.country}}",
+            "hubspotId":      "={{$json.sheetsRow.hubspotId}}",
+            "hubspotStatus":  "={{$json.sheetsRow.hubspotStatus}}",
+            "dealName":       "={{$json.sheetsRow.dealName}}",
+            "dealAmount":     "={{$json.sheetsRow.dealAmount}}",
+            "dealStage":      "={{$json.sheetsRow.dealStage}}",
+            "receivedAt":     "={{$json.sheetsRow.receivedAt}}",
+            "lastSyncedAt":   "={{$json.sheetsRow.lastSyncedAt}}",
+            "hasErrors":      "={{$json.sheetsRow.hasErrors}}",
+            "errorSummary":   "={{$json.sheetsRow.errorSummary}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "03000000-0000-0000-0000-000000000007",
+      "name": "sink.Sheets.UpsertContact",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1560, 400],
+      "continueOnFail": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "cred-google-sheets", "name": "Google Sheets — Service Account" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * FINAL SYNC STATUS EVALUATOR\n * ──────────────────────────────────────────────────────────────────\n * Computes the overall sync outcome across all destinations\n * and prepares the structured API response.\n */\n\nconst d = $input.first().json;\n\nconst allSucceeded  = d.destinations.hubspot !== 'failed' && d.destinations.sheets !== 'failed';\nconst anySucceeded  = d.destinations.hubspot !== 'failed' || d.destinations.sheets !== 'failed';\nconst noneSucceeded = !anySucceeded;\n\nconst overallStatus = allSucceeded ? 'full_success'\n  : anySucceeded   ? 'partial_success'\n  : 'failed';\n\nconst httpStatusCode = allSucceeded ? 200 : anySucceeded ? 207 : 500;\n\nreturn [{\n  json: {\n    ...d,\n    syncResult: {\n      overallStatus,\n      httpStatusCode,\n      destinations: d.destinations,\n      errors:       d.errors,\n      syncId:       d.syncId,\n      traceId:      d.traceId\n    }\n  }\n}];"
+      },
+      "id": "03000000-0000-0000-0000-000000000008",
+      "name": "fn.ComputeSyncStatus",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1780, 400]
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.syncResult.overallStatus}}", "operation": "notEqual", "value2": "full_success" }]
+        }
+      },
+      "id": "03000000-0000-0000-0000-000000000009",
+      "name": "gate.HasErrors?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2000, 320]
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":    "=={{$json.syncResult.overallStatus === 'full_success' ? 'INFO' : 'WARN'}}",
+            "workflow": "wf.crm-sync",
+            "event":    "=crm.sync.{{$json.syncResult.overallStatus}}",
+            "message":  "=Sync {{$json.syncResult.overallStatus}} for {{$json.contact.email}} | HubSpot={{$json.destinations.hubspot}} Sheets={{$json.destinations.sheets}}",
+            "traceId":  "={{$json.traceId}}",
+            "data":     "={{ { syncId: $json.syncId, eventType: $json.eventType, contactEmail: $json.contact.email, destinations: $json.destinations, errors: $json.errors } }}"
+          }
+        }
+      },
+      "id": "03000000-0000-0000-0000-000000000010",
+      "name": "log.SyncResult",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 520]
+    },
+
+    {
+      "parameters": {
+        "channel":  "#automation-errors",
+        "text":     "=⚠️ *CRM Sync {{$json.syncResult.overallStatus}}*\nContact: {{$json.contact.email}} | Sync: `{{$json.syncId}}`\nErrors: ```{{JSON.stringify($json.syncResult.errors, null, 2)}}```",
+        "otherOptions": {}
+      },
+      "id": "03000000-0000-0000-0000-000000000011",
+      "name": "notify.Slack.SyncError",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2220, 220],
+      "continueOnFail": true,
+      "credentials": {
+        "slackApi": { "id": "cred-slack", "name": "Slack — Automation Bot" }
+      }
+    },
+
+    {
+      "parameters": {
+        "respondWith":   "json",
+        "responseCode":  "={{$json.syncResult.httpStatusCode}}",
+        "responseBody":  "={\n  \"status\":       \"{{$json.syncResult.overallStatus}}\",\n  \"syncId\":       \"{{$json.syncId}}\",\n  \"traceId\":      \"{{$json.traceId}}\",\n  \"destinations\": {{JSON.stringify($json.syncResult.destinations)}},\n  \"errors\":       {{JSON.stringify($json.syncResult.errors)}}\n}"
+      },
+      "id": "03000000-0000-0000-0000-000000000012",
+      "name": "respond.SyncResult",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2220, 520]
+    }
+  ],
+
+  "connections": {
+    "trigger.WebhookCrmEvent":    { "main": [[{ "node": "fn.AuthAndNormalise",        "type": "main", "index": 0 }]] },
+    "fn.AuthAndNormalise":        { "main": [[{ "node": "fn.TransformForHubSpot",     "type": "main", "index": 0 }]] },
+    "fn.TransformForHubSpot":     { "main": [[{ "node": "http.HubSpotUpsert",         "type": "main", "index": 0 }]] },
+    "http.HubSpotUpsert":         { "main": [[{ "node": "fn.EvaluateHubSpotResult",   "type": "main", "index": 0 }]] },
+    "fn.EvaluateHubSpotResult":   { "main": [[{ "node": "fn.TransformForSheets",      "type": "main", "index": 0 }]] },
+    "fn.TransformForSheets":      { "main": [[{ "node": "sink.Sheets.UpsertContact",  "type": "main", "index": 0 }]] },
+    "sink.Sheets.UpsertContact":  { "main": [[{ "node": "fn.ComputeSyncStatus",       "type": "main", "index": 0 }]] },
+    "fn.ComputeSyncStatus": { "main": [[
+      { "node": "gate.HasErrors?",  "type": "main", "index": 0 },
+      { "node": "log.SyncResult",   "type": "main", "index": 0 },
+      { "node": "respond.SyncResult", "type": "main", "index": 0 }
+    ]] },
+    "gate.HasErrors?": {
+      "main": [
+        [{ "node": "notify.Slack.SyncError", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+
+  "settings": {
+    "errorWorkflow":            "[SHARED] Global Error Handler",
+    "saveDataErrorExecution":   "all",
+    "saveDataSuccessExecution": "last",
+    "saveManualExecutions":     true,
+    "executionOrder":           "v1"
+  },
+  "staticData": null,
+  "tags": ["crm", "hubspot", "google-sheets", "sync", "v2", "production"],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "v2.0.0"
+}

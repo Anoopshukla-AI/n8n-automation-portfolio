@@ -1,0 +1,244 @@
+{
+  "name": "wf.ai-email-responder",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "filters": { "readStatus": "unread", "labels": ["INBOX"] },
+        "options": { "downloadAttachments": false }
+      },
+      "id": "02000000-0000-0000-0000-000000000001",
+      "name": "trigger.GmailPoll",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "credentials": {
+        "gmailOAuth2": { "id": "cred-gmail", "name": "Gmail — Automation Account" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * EMAIL PREPROCESSOR\n * ──────────────────────────────────────────────────────────────────\n * 1. Detects and rejects auto-responder loops (RFC 3834 compliant)\n * 2. Sanitises HTML body → clean plain text\n * 3. Stamps traceId for correlation across all downstream nodes\n * 4. Truncates body to 2500 chars to stay within token budget\n */\n\nconst raw = $input.first().json;\n\n// ── Auto-responder loop guard (RFC 3834) ──────────────────────────\nconst LOOP_SIGNALS = [\n  raw.headers?.['auto-submitted']                && raw.headers['auto-submitted'] !== 'no',\n  raw.headers?.['x-auto-response-suppress'],\n  raw.headers?.['precedence'] === 'bulk',\n  raw.headers?.['precedence'] === 'auto-reply',\n  /^(automatic reply|out of office|auto:|noreply@|no-reply@)/i.test(raw.subject ?? ''),\n  /^re:re:re:/i.test(raw.subject ?? ''),\n];\n\nif (LOOP_SIGNALS.some(Boolean)) {\n  throw new Error(`LOOP_GUARD: auto-responder email discarded [subject: ${(raw.subject ?? '').slice(0,60)}]`);\n}\n\n// ── Body sanitisation ─────────────────────────────────────────────\nconst stripHtml = (s) => (s ?? '')\n  .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n  .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n  .replace(/<br\\s*\\/?>/gi, '\\n')\n  .replace(/<p[^>]*>/gi,   '\\n')\n  .replace(/<[^>]+>/g,      '')\n  .replace(/&nbsp;/g,       ' ')\n  .replace(/&amp;/g,        '&')\n  .replace(/&lt;/g,         '<')\n  .replace(/&gt;/g,         '>')\n  .replace(/[ \\t]+/g,       ' ')\n  .replace(/\\n{3,}/g,       '\\n\\n')\n  .trim();\n\nconst rawBody   = raw.text || stripHtml(raw.html) || raw.snippet || '';\nconst bodyClean = rawBody.length > 2500 ? rawBody.slice(0, 2500) + '…[truncated]' : rawBody;\n\n// ── Sender extraction ─────────────────────────────────────────────\nconst fromObj    = raw.from?.value?.[0] ?? {};\nconst senderName = fromObj.name || fromObj.address?.split('@')[0] || 'there';\nconst senderEmail = (fromObj.address || raw.from?.text || '').toLowerCase().trim();\n\nconst traceId = `tr-email-${Date.now().toString(36)}`;\n\nreturn [{\n  json: {\n    traceId,\n    emailId:      raw.id,\n    threadId:     raw.threadId,\n    subject:      raw.subject || '(no subject)',\n    senderName,\n    senderEmail,\n    body:         bodyClean,\n    snippet:      (raw.snippet || '').slice(0, 200),\n    receivedAt:   raw.date || new Date().toISOString(),\n    labels:       raw.labelIds || []\n  }\n}];"
+      },
+      "id": "02000000-0000-0000-0000-000000000002",
+      "name": "fn.Preprocess",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 400]
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an email triage system. Analyze the email and reply ONLY with a JSON object — no markdown, no prose, no explanation.\n\nSchema:\n{\n  \"intent\":              \"support|sales|urgent|billing|feedback|general|spam\",\n  \"priority\":            \"high|medium|low\",\n  \"sentiment\":           \"positive|neutral|negative|frustrated\",\n  \"frustrationScore\":    0-10,\n  \"keyTopics\":           [\"string\"],\n  \"requiresHumanReview\": true|false,\n  \"reviewReason\":        \"string|null\",\n  \"confidence\":          0.0-1.0,\n  \"oneSentenceSummary\":  \"string\"\n}\n\nrequiresHumanReview = true when ANY of:\n  - confidence < 0.72\n  - sentiment is 'frustrated' AND frustrationScore >= 7\n  - intent is 'urgent'\n  - subject or body contains legal / lawsuit / attorney / refund demand\n\nReturn ONLY the JSON object."
+            },
+            {
+              "role": "user",
+              "content": "=Subject: {{$json.subject}}\nFrom: {{$json.senderName}} <{{$json.senderEmail}}>\n\n{{$json.body}}"
+            }
+          ]
+        },
+        "options": { "temperature": 0.05, "maxTokens": 350 }
+      },
+      "id": "02000000-0000-0000-0000-000000000003",
+      "name": "ai.ClassifyIntent",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "openAiApi": { "id": "cred-openai", "name": "OpenAI API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * CLASSIFICATION PARSER + BUSINESS RULE LAYER\n * ──────────────────────────────────────────────────────────────────\n * Parses the LLM JSON response defensively.\n * Applies deterministic business rules that override AI judgment\n * — this is the safety net between AI and real customer comms.\n */\n\nconst email  = $input.all()[0].json;\nconst aiText = $input.all()[1]?.json?.message?.content ?? '{}';\n\n// ── Safe JSON parse ───────────────────────────────────────────────\nlet cls;\ntry {\n  cls = JSON.parse(aiText.replace(/```json|```/g, '').trim());\n} catch (_) {\n  cls = {\n    intent: 'general', priority: 'medium',\n    sentiment: 'neutral', frustrationScore: 0,\n    keyTopics: [], requiresHumanReview: true,\n    reviewReason: 'JSON_PARSE_FAILURE',\n    confidence: 0.0, oneSentenceSummary: 'Classification unavailable'\n  };\n}\n\n// ── Deterministic override rules (always beat AI) ────────────────\nconst LEGAL_PATTERN  = /lawsuit|attorney|legal action|refund demand|chargeback|fraud/i;\nconst URGENT_PATTERN = /urgent|critical|outage|data loss|emergency|hack/i;\n\nif (LEGAL_PATTERN.test(email.body)) {\n  cls.requiresHumanReview = true;\n  cls.priority            = 'high';\n  cls.reviewReason        = 'LEGAL_LANGUAGE_DETECTED';\n}\nif (URGENT_PATTERN.test(email.subject + ' ' + email.body)) {\n  cls.requiresHumanReview = true;\n  cls.priority            = 'high';\n  cls.reviewReason        = cls.reviewReason || 'URGENCY_PATTERN_DETECTED';\n}\nif (cls.confidence < 0.72) {\n  cls.requiresHumanReview = true;\n  cls.reviewReason        = cls.reviewReason || `LOW_CONFIDENCE:${cls.confidence}`;\n}\n\nreturn [{ json: { ...email, classification: cls } }];"
+      },
+      "id": "02000000-0000-0000-0000-000000000004",
+      "name": "fn.ParseAndApplyRules",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 400]
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":    "INFO",
+            "workflow": "wf.ai-email-responder",
+            "event":    "email.classified",
+            "message":  "=Email classified: intent={{$json.classification.intent}} priority={{$json.classification.priority}} review={{$json.classification.requiresHumanReview}}",
+            "traceId":  "={{$json.traceId}}",
+            "data":     "={{ { emailId: $json.emailId, intent: $json.classification.intent, confidence: $json.classification.confidence } }}"
+          }
+        }
+      },
+      "id": "02000000-0000-0000-0000-000000000005",
+      "name": "log.Classified",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [900, 600]
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{$json.classification.requiresHumanReview}}", "value2": true }]
+        }
+      },
+      "id": "02000000-0000-0000-0000-000000000006",
+      "name": "gate.NeedsHumanReview?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 400]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// Build rich Slack review-queue notification\nconst d = $input.first().json;\nconst c = d.classification;\n\nconst PRIORITY_EMOJI = { high: '🔴', medium: '🟡', low: '🟢' };\n\nreturn [{\n  json: {\n    ...d,\n    slackBlocks: [\n      {\n        type: 'header',\n        text: { type: 'plain_text', text: `${PRIORITY_EMOJI[c.priority] ?? '📧'} Email Review Required`, emoji: true }\n      },\n      {\n        type: 'section',\n        fields: [\n          { type: 'mrkdwn', text: `*From:*\\n${d.senderName} <${d.senderEmail}>` },\n          { type: 'mrkdwn', text: `*Intent:*\\n${c.intent}` },\n          { type: 'mrkdwn', text: `*Priority:*\\n${c.priority}` },\n          { type: 'mrkdwn', text: `*Confidence:*\\n${(c.confidence * 100).toFixed(0)}%` },\n          { type: 'mrkdwn', text: `*Sentiment:*\\n${c.sentiment} (${c.frustrationScore}/10)` },\n          { type: 'mrkdwn', text: `*Review Reason:*\\n${c.reviewReason ?? 'N/A'}` }\n        ]\n      },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Subject:*\\n${d.subject}` } },\n      { type: 'section', text: { type: 'mrkdwn', text: `*Summary:*\\n${c.oneSentenceSummary}` } },\n      {\n        type: 'context',\n        elements: [{ type: 'mrkdwn', text: `Email ID: \\`${d.emailId}\\` | Trace: \\`${d.traceId}\\`` }]\n      },\n      { type: 'divider' }\n    ]\n  }\n}];"
+      },
+      "id": "02000000-0000-0000-0000-000000000007",
+      "name": "fn.BuildReviewSlackMsg",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 260]
+    },
+
+    {
+      "parameters": {
+        "channel":  "#email-review-queue",
+        "blocksUi": { "blocksValues": "={{$json.slackBlocks}}" },
+        "text":     "=👀 Review Required: {{$json.subject}} from {{$json.senderEmail}}",
+        "otherOptions": {}
+      },
+      "id": "02000000-0000-0000-0000-000000000008",
+      "name": "notify.Slack.ReviewQueue",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1560, 260],
+      "continueOnFail": true,
+      "credentials": {
+        "slackApi": { "id": "cred-slack", "name": "Slack — Automation Bot" }
+      }
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "=You are a professional customer success representative. Write a helpful, empathetic reply.\n\nEmail Context:\n- Intent: {{$json.classification.intent}}\n- Priority: {{$json.classification.priority}}\n- Customer sentiment: {{$json.classification.sentiment}} (frustration {{$json.classification.frustrationScore}}/10)\n- Key topics: {{$json.classification.keyTopics.join(', ')}}\n\nInstructions by intent:\n- support:  Acknowledge the problem clearly. Provide 2-3 concrete next steps. Set a realistic timeline.\n- sales:    Show enthusiasm. Offer a demo. Name 3 specific value props relevant to their context.\n- billing:  Acknowledge with empathy. Assure resolution. Give billing team contact.\n- urgent:   Immediate acknowledgment. Confirm escalation. Provide emergency contact channel.\n- feedback: Thank them sincerely. Be specific about how feedback will be actioned.\n- general:  Warm, direct, helpful.\n\nConstraints:\n- Max 160 words\n- No markdown in the email body\n- Do NOT mention AI, automation, or auto-reply\n- Sign off: 'Best regards,\\nThe Support Team'\n- If sentiment is frustrated, open with genuine acknowledgment of frustration before anything else"
+            },
+            {
+              "role": "user",
+              "content": "=Write a reply to:\n\nFrom: {{$json.senderName}}\nSubject: {{$json.subject}}\n\n{{$json.body}}"
+            }
+          ]
+        },
+        "options": { "temperature": 0.65, "maxTokens": 500 }
+      },
+      "id": "02000000-0000-0000-0000-000000000009",
+      "name": "ai.GenerateReply",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1340, 540],
+      "credentials": {
+        "openAiApi": { "id": "cred-openai", "name": "OpenAI API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// Merge email context + AI reply; add abuse-prevention guardrails\nconst email   = $input.all()[0].json;\nconst replyRaw = $input.all()[1]?.json?.message?.content;\n\nif (!replyRaw || replyRaw.trim().length < 20) {\n  throw new Error(`AI_REPLY_EMPTY: empty or invalid reply generated for emailId=${email.emailId}`);\n}\n\n// Safety: strip any accidental AI self-disclosure\nconst FORBIDDEN = /\\b(as an ai|i am an ai|i'm an ai|artificial intelligence|language model|chatgpt|openai)\\b/gi;\nconst replyClean = replyRaw.replace(FORBIDDEN, '').trim();\n\nreturn [{\n  json: {\n    ...email,\n    replyBody:    replyClean,\n    replySubject: email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`\n  }\n}];"
+      },
+      "id": "02000000-0000-0000-0000-000000000010",
+      "name": "fn.FinaliseReply",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 540]
+    },
+
+    {
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{$json.emailId}}",
+        "threadId":  "={{$json.threadId}}",
+        "message":   "={{$json.replyBody}}",
+        "options":   {}
+      },
+      "id": "02000000-0000-0000-0000-000000000011",
+      "name": "action.GmailSendReply",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1780, 540],
+      "credentials": {
+        "gmailOAuth2": { "id": "cred-gmail", "name": "Gmail — Automation Account" }
+      }
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":    "INFO",
+            "workflow": "wf.ai-email-responder",
+            "event":    "email.replied",
+            "message":  "=Auto-reply sent to {{$json.senderEmail}} (intent={{$json.classification.intent}})",
+            "traceId":  "={{$json.traceId}}",
+            "data":     "={{ { emailId: $json.emailId, intent: $json.classification.intent, priority: $json.classification.priority } }}"
+          }
+        }
+      },
+      "id": "02000000-0000-0000-0000-000000000012",
+      "name": "log.ReplySent",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 540]
+    }
+  ],
+
+  "connections": {
+    "trigger.GmailPoll":        { "main": [[{ "node": "fn.Preprocess",          "type": "main", "index": 0 }]] },
+    "fn.Preprocess":            { "main": [[{ "node": "ai.ClassifyIntent",       "type": "main", "index": 0 }]] },
+    "ai.ClassifyIntent":        { "main": [[{ "node": "fn.ParseAndApplyRules",   "type": "main", "index": 0 }]] },
+    "fn.ParseAndApplyRules":    { "main": [[
+      { "node": "gate.NeedsHumanReview?", "type": "main", "index": 0 },
+      { "node": "log.Classified",         "type": "main", "index": 0 }
+    ]] },
+    "gate.NeedsHumanReview?": {
+      "main": [
+        [{ "node": "fn.BuildReviewSlackMsg", "type": "main", "index": 0 }],
+        [{ "node": "ai.GenerateReply",       "type": "main", "index": 0 }]
+      ]
+    },
+    "fn.BuildReviewSlackMsg":   { "main": [[{ "node": "notify.Slack.ReviewQueue", "type": "main", "index": 0 }]] },
+    "ai.GenerateReply":         { "main": [[{ "node": "fn.FinaliseReply",          "type": "main", "index": 0 }]] },
+    "fn.FinaliseReply":         { "main": [[{ "node": "action.GmailSendReply",     "type": "main", "index": 0 }]] },
+    "action.GmailSendReply":    { "main": [[{ "node": "log.ReplySent",             "type": "main", "index": 0 }]] }
+  },
+
+  "settings": {
+    "errorWorkflow":            "[SHARED] Global Error Handler",
+    "saveDataErrorExecution":   "all",
+    "saveDataSuccessExecution": "last",
+    "saveManualExecutions":     true,
+    "executionOrder":           "v1"
+  },
+  "staticData": null,
+  "tags": ["ai", "email", "gmail", "openai", "v2", "production"],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "v2.0.0"
+}

@@ -1,0 +1,370 @@
+{
+  "name": "wf.etl-pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{
+            "field": "hours",
+            "hoursInterval": 24,
+            "triggerAtHour": 6,
+            "triggerAtMinute": 0
+          }]
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000001",
+      "name": "trigger.DailySchedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * PIPELINE CONTEXT INITIALISER\n * ──────────────────────────────────────────────────────────────────\n * Generates all date ranges, IDs, and configuration that downstream\n * nodes depend on. Single source of truth for the entire run.\n */\n\nconst now       = new Date();\nconst yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);\n\nconst pad  = (n) => String(n).padStart(2, '0');\nconst ymd  = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;\nconst iso  = (d) => d.toISOString();\n\nconst reportDate  = ymd(yesterday);\nconst pipelineId  = `ETL-${reportDate}-${now.getTime().toString(36).toUpperCase()}`;\nconst traceId     = `tr-etl-${now.getTime().toString(36)}`;\n\nreturn [{\n  json: {\n    pipelineId,\n    traceId,\n    reportDate,\n    runDate:   ymd(now),\n    startTime: iso(now),\n    window: {\n      from:    `${reportDate}T00:00:00Z`,\n      to:      `${reportDate}T23:59:59Z`,\n      fromEpoch: Math.floor(new Date(`${reportDate}T00:00:00Z`).getTime() / 1000),\n      toEpoch:   Math.floor(new Date(`${reportDate}T23:59:59Z`).getTime() / 1000)\n    },\n    sources:  ['analytics', 'crm', 'revenue'],\n    results:  {},   // populated per-source\n    quality:  {},   // quality flags per-source\n    errors:   []\n  }\n}];"
+      },
+      "id": "05000000-0000-0000-0000-000000000002",
+      "name": "fn.InitContext",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 400]
+    },
+
+    {
+      "parameters": {
+        "url": "https://analytics.example.com/api/v2/metrics",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "date_from",   "value": "={{$json.window.from}}" },
+            { "name": "date_to",     "value": "={{$json.window.to}}" },
+            { "name": "metrics",     "value": "pageviews,sessions,conversions,bounce_rate,avg_session_duration,new_users,returning_users" },
+            { "name": "breakdowns",  "value": "source,device,country" },
+            { "name": "format",      "value": "json" }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": { "response": { "fullResponse": true, "responseFormat": "json" } }
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000003",
+      "name": "http.FetchAnalytics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [700, 240],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-analytics", "name": "Analytics API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "url": "https://crm.example.com/api/v1/stats/daily",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "date",    "value": "={{$json.reportDate}}" },
+            { "name": "include", "value": "contacts,deals,activities,pipeline" }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": { "response": { "fullResponse": true, "responseFormat": "json" } }
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000004",
+      "name": "http.FetchCRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [700, 400],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-crm", "name": "CRM API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "url": "https://api.stripe.com/v1/balance/history",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "created[gte]", "value": "={{$json.window.fromEpoch}}" },
+            { "name": "created[lte]", "value": "={{$json.window.toEpoch}}" },
+            { "name": "limit",        "value": "100" },
+            { "name": "expand[]",     "value": "data.source" }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": { "response": { "fullResponse": true, "responseFormat": "json" } }
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000005",
+      "name": "http.FetchRevenue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [700, 560],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-stripe", "name": "Stripe API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "/*\n * ETL TRANSFORM + KPI ENGINE\n * ──────────────────────────────────────────────────────────────────\n * - Defensive extraction: every source is optional (circuit-breaker pattern)\n * - Data quality flags: GOOD / DEGRADED / MISSING per source\n * - Computed KPIs require explicit null handling\n * - All numbers rounded at output layer, never during calculation\n */\n\nconst items   = $input.all();\nconst ctx     = items[0].json;   // pipeline context from InitContext\nconst anaResp = items[1]?.json;  // analytics HTTP response\nconst crmResp = items[2]?.json;  // crm HTTP response\nconst revResp = items[3]?.json;  // revenue HTTP response\n\n// ── Quality assessment helper ──────────────────────────────────────\nconst assess = (resp, requiredKey) => {\n  if (!resp) return { status: 'MISSING', data: {} };\n  const ok  = resp.statusCode >= 200 && resp.statusCode < 300;\n  const raw = resp.body ?? {};\n  if (!ok)              return { status: 'ERROR',    data: {}, httpStatus: resp.statusCode };\n  if (!raw[requiredKey]) return { status: 'DEGRADED', data: raw };\n  return { status: 'GOOD', data: raw };\n};\n\n// ── Source extraction ─────────────────────────────────────────────\nconst ana = assess(anaResp, 'sessions');\nconst crm = assess(crmResp, 'new_contacts');\nconst rev = assess(revResp, 'data');\n\n// ── Safe math ─────────────────────────────────────────────────────\nconst safe = (v, fallback = 0) => (typeof v === 'number' && isFinite(v)) ? v : fallback;\nconst pct  = (n, d)  => d > 0 ? (n / d) * 100 : 0;\nconst avg  = (n, d)  => d > 0 ? n / d : 0;\nconst r2   = (n)      => Math.round(n * 100) / 100;\nconst r0   = (n)      => Math.round(n);\n\n// ── Analytics metrics ─────────────────────────────────────────────\nconst ad = ana.data;\nconst analytics = {\n  pageviews:           safe(ad.pageviews),\n  sessions:            safe(ad.sessions),\n  conversions:         safe(ad.conversions),\n  newUsers:            safe(ad.new_users),\n  returningUsers:      safe(ad.returning_users),\n  bounceRate:          r2(safe(ad.bounce_rate)),\n  avgSessionDuration:  r0(safe(ad.avg_session_duration)),\n  conversionRate:      r2(pct(safe(ad.conversions), safe(ad.sessions))),\n  dataQuality:         ana.status\n};\n\n// ── CRM metrics ────────────────────────────────────────────────────\nconst cd = crm.data;\nconst crmMetrics = {\n  newContacts:         safe(cd.new_contacts),\n  dealsCreated:        safe(cd.deals_created),\n  dealsClosed:         safe(cd.deals_closed),\n  pipelineValue:       r2(safe(cd.pipeline_value)),\n  activitiesLogged:    safe(cd.activities_logged),\n  closeRate:           r2(pct(safe(cd.deals_closed), safe(cd.deals_created))),\n  avgDealSize:         r2(avg(safe(cd.pipeline_value), safe(cd.deals_created))),\n  dataQuality:         crm.status\n};\n\n// ── Revenue metrics ────────────────────────────────────────────────\nconst txns   = Array.isArray(rev.data?.data) ? rev.data.data : [];\nconst charges = txns.filter(t => t.type === 'charge');\nconst refunds = txns.filter(t => t.type === 'refund');\n\nconst grossRevenue = charges.reduce((s,t) => s + safe(t.amount) / 100, 0);\nconst totalRefunds = refunds.reduce((s,t) => s + safe(t.amount) / 100, 0);\nconst netRevenue   = grossRevenue - totalRefunds;\nconst txnCount     = charges.length;\n\nconst revenueMetrics = {\n  grossRevenue:      r2(grossRevenue),\n  totalRefunds:      r2(totalRefunds),\n  netRevenue:        r2(netRevenue),\n  refundRate:        r2(pct(refunds.length, txnCount)),\n  transactionCount:  txnCount,\n  refundCount:       refunds.length,\n  avgTransactionValue: r2(avg(grossRevenue, txnCount)),\n  dataQuality:       rev.status\n};\n\n// ── Composite KPIs (require multiple sources) ─────────────────────\nconst kpis = {\n  revenuePerSession:        r2(avg(netRevenue, analytics.sessions)),\n  revenuePerNewContact:     r2(avg(netRevenue, crmMetrics.newContacts)),\n  leadToCloseRate:          r2(pct(crmMetrics.dealsClosed, crmMetrics.newContacts)),\n  costPerConversion:        null, // requires spend data — placeholder\n  dataCompleteness:         `${[ana.status, crm.status, rev.status].filter(s => s === 'GOOD').length}/3`\n};\n\n// ── Pipeline quality decision ──────────────────────────────────────\nconst goodSources = [ana.status, crm.status, rev.status].filter(s => s === 'GOOD').length;\nconst pipelineStatus = goodSources === 3 ? 'COMPLETE'\n  : goodSources >= 2 ? 'DEGRADED'\n  : 'FAILED';\n\nreturn [{\n  json: {\n    ...ctx,\n    pipelineStatus,\n    analytics,\n    crm:     crmMetrics,\n    revenue: revenueMetrics,\n    kpis,\n    sourceQuality: { analytics: ana.status, crm: crm.status, revenue: rev.status },\n    transformedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "05000000-0000-0000-0000-000000000006",
+      "name": "fn.TransformAndComputeKPIs",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [940, 400]
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.pipelineStatus}}", "operation": "equal", "value2": "FAILED" }]
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000007",
+      "name": "gate.PipelineFailed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1160, 400]
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":    "ERROR",
+            "workflow": "wf.etl-pipeline",
+            "event":    "pipeline.failed",
+            "message":  "=ETL pipeline FAILED for {{$json.reportDate}} — all sources degraded",
+            "traceId":  "={{$json.traceId}}",
+            "data":     "={{ { pipelineId: $json.pipelineId, sourceQuality: $json.sourceQuality } }}"
+          }
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000008",
+      "name": "log.PipelineFailed",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1380, 240]
+    },
+
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.METRICS_SHEET_ID}}",
+        "sheetName":  "daily_metrics",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "pipelineId":           "={{$json.pipelineId}}",
+            "traceId":              "={{$json.traceId}}",
+            "reportDate":           "={{$json.reportDate}}",
+            "pipelineStatus":       "={{$json.pipelineStatus}}",
+            "dataCompleteness":     "={{$json.kpis.dataCompleteness}}",
+            "pageviews":            "={{$json.analytics.pageviews}}",
+            "sessions":             "={{$json.analytics.sessions}}",
+            "newUsers":             "={{$json.analytics.newUsers}}",
+            "conversions":          "={{$json.analytics.conversions}}",
+            "conversionRate":       "={{$json.analytics.conversionRate}}",
+            "bounceRate":           "={{$json.analytics.bounceRate}}",
+            "avgSessionDuration":   "={{$json.analytics.avgSessionDuration}}",
+            "newContacts":          "={{$json.crm.newContacts}}",
+            "dealsCreated":         "={{$json.crm.dealsCreated}}",
+            "dealsClosed":          "={{$json.crm.dealsClosed}}",
+            "closeRate":            "={{$json.crm.closeRate}}",
+            "pipelineValue":        "={{$json.crm.pipelineValue}}",
+            "grossRevenue":         "={{$json.revenue.grossRevenue}}",
+            "totalRefunds":         "={{$json.revenue.totalRefunds}}",
+            "netRevenue":           "={{$json.revenue.netRevenue}}",
+            "transactionCount":     "={{$json.revenue.transactionCount}}",
+            "avgTransactionValue":  "={{$json.revenue.avgTransactionValue}}",
+            "refundRate":           "={{$json.revenue.refundRate}}",
+            "revenuePerSession":    "={{$json.kpis.revenuePerSession}}",
+            "revenuePerContact":    "={{$json.kpis.revenuePerNewContact}}",
+            "leadToCloseRate":      "={{$json.kpis.leadToCloseRate}}",
+            "analyticsQuality":     "={{$json.sourceQuality.analytics}}",
+            "crmQuality":           "={{$json.sourceQuality.crm}}",
+            "revenueQuality":       "={{$json.sourceQuality.revenue}}",
+            "transformedAt":        "={{$json.transformedAt}}",
+            "startTime":            "={{$json.startTime}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "05000000-0000-0000-0000-000000000009",
+      "name": "sink.Sheets.StoreMetrics",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1380, 500],
+      "continueOnFail": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "cred-google-sheets", "name": "Google Sheets — Service Account" }
+      }
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a senior data analyst writing a concise daily business summary for an executive audience.\nWrite 3 short paragraphs (100-180 words total) covering: (1) Revenue highlights, (2) Traffic & growth, (3) Pipeline & deals. Include one concrete recommendation. Plain text only — no markdown, no bullet points. Be specific with numbers. Flag any data quality issues if present."
+            },
+            {
+              "role": "user",
+              "content": "=Generate executive summary for {{$json.reportDate}} (Pipeline Status: {{$json.pipelineStatus}}):\n\nREVENUE: Net ${{$json.revenue.netRevenue}}, {{$json.revenue.transactionCount}} txns @ avg ${{$json.revenue.avgTransactionValue}}, ${{$json.revenue.totalRefunds}} refunds ({{$json.revenue.refundRate}}% refund rate)\nTRAFFIC: {{$json.analytics.sessions}} sessions, {{$json.analytics.pageviews}} pageviews, {{$json.analytics.newUsers}} new / {{$json.analytics.returningUsers}} returning, {{$json.analytics.conversionRate}}% CVR, {{$json.analytics.bounceRate}}% bounce, {{$json.analytics.avgSessionDuration}}s avg\nCRM: {{$json.crm.newContacts}} new contacts, {{$json.crm.dealsCreated}} deals opened, {{$json.crm.dealsClosed}} closed, {{$json.crm.closeRate}}% close rate, ${{$json.crm.pipelineValue}} pipeline\nKPIs: Revenue/session ${{$json.kpis.revenuePerSession}}, Revenue/contact ${{$json.kpis.revenuePerNewContact}}, Lead-close {{$json.kpis.leadToCloseRate}}%\nDATA QUALITY: Analytics={{$json.sourceQuality.analytics}} CRM={{$json.sourceQuality.crm}} Revenue={{$json.sourceQuality.revenue}}"
+            }
+          ]
+        },
+        "options": { "temperature": 0.4, "maxTokens": 450 }
+      },
+      "id": "05000000-0000-0000-0000-000000000010",
+      "name": "ai.GenerateSummary",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1380, 700],
+      "credentials": {
+        "openAiApi": { "id": "cred-openai", "name": "OpenAI API" }
+      }
+    },
+
+    {
+      "parameters": {
+        "functionCode": "// Merge pipeline data + AI summary; compute final runtime stats\nconst pipeline = $input.all()[0].json;\nconst summary  = $input.all()[1]?.json?.message?.content ?? 'Summary unavailable — check source data quality.';\n\nconst durationMs = Date.now() - new Date(pipeline.startTime).getTime();\n\nreturn [{\n  json: {\n    ...pipeline,\n    aiSummary: summary,\n    durationMs,\n    durationSec: Math.round(durationMs / 1000)\n  }\n}];"
+      },
+      "id": "05000000-0000-0000-0000-000000000011",
+      "name": "fn.BuildReport",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1600, 580]
+    },
+
+    {
+      "parameters": {
+        "channel": "#daily-metrics",
+        "text":    "=📊 Daily Report {{$json.reportDate}}",
+        "blocksUi": {
+          "blocksValues": "=[{\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"📊 Daily Business Report — {{$json.reportDate}}\",\"emoji\":true}},{\"type\":\"section\",\"fields\":[{\"type\":\"mrkdwn\",\"text\":\"*💰 Net Revenue*\\n${{$json.revenue.netRevenue}}\"},{\"type\":\"mrkdwn\",\"text\":\"*📦 Transactions*\\n{{$json.revenue.transactionCount}} (avg ${{$json.revenue.avgTransactionValue}})\"},{\"type\":\"mrkdwn\",\"text\":\"*📈 Sessions*\\n{{$json.analytics.sessions}}\"},{\"type\":\"mrkdwn\",\"text\":\"*🎯 Conv. Rate*\\n{{$json.analytics.conversionRate}}%\"},{\"type\":\"mrkdwn\",\"text\":\"*🤝 New Contacts*\\n{{$json.crm.newContacts}}\"},{\"type\":\"mrkdwn\",\"text\":\"*✅ Deals Closed*\\n{{$json.crm.dealsClosed}} ({{$json.crm.closeRate}}%)\"}]},{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*🤖 AI Summary*\\n{{$json.aiSummary}}\"}},{\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Pipeline: `{{$json.pipelineId}}` | Status: {{$json.pipelineStatus}} | Data: {{$json.kpis.dataCompleteness}} | Runtime: {{$json.durationSec}}s\"}]},{\"type\":\"divider\"}]"
+        },
+        "otherOptions": { "username": "Data Pipeline", "icon_emoji": ":bar_chart:" }
+      },
+      "id": "05000000-0000-0000-0000-000000000012",
+      "name": "notify.Slack.DailyReport",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1820, 480],
+      "continueOnFail": true,
+      "credentials": { "slackApi": { "id": "cred-slack", "name": "Slack — Automation Bot" } }
+    },
+
+    {
+      "parameters": {
+        "fromEmail": "pipeline@yourcompany.com",
+        "toEmail":   "={{$env.REPORT_EMAIL_LIST}}",
+        "subject":   "=📊 {{$json.reportDate}} | Revenue ${{$json.revenue.netRevenue}} | {{$json.analytics.sessions}} Sessions | {{$json.pipelineStatus}}",
+        "emailType": "html",
+        "message":   "=<!DOCTYPE html><html><head><meta charset='UTF-8'><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#1a1a1a}h1{font-size:20px;color:#0f172a;border-bottom:3px solid #3b82f6;padding-bottom:8px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-top:24px}.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0}.metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px}.metric-value{font-size:22px;font-weight:700;color:#0f172a}.metric-label{font-size:11px;color:#94a3b8;margin-top:2px}.summary{background:#eff6ff;border-left:4px solid #3b82f6;padding:16px;border-radius:4px;line-height:1.6;font-size:14px}.quality-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}.good{background:#dcfce7;color:#166534}.degraded{background:#fef9c3;color:#854d0e}.missing{background:#fee2e2;color:#991b1b}footer{margin-top:32px;font-size:11px;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:12px}</style></head><body><h1>📊 Daily Business Report — {{$json.reportDate}}</h1><h2>Revenue</h2><div class='metric-grid'><div class='metric'><div class='metric-value'>${{$json.revenue.netRevenue}}</div><div class='metric-label'>Net Revenue</div></div><div class='metric'><div class='metric-value'>{{$json.revenue.transactionCount}}</div><div class='metric-label'>Transactions</div></div><div class='metric'><div class='metric-value'>${{$json.revenue.avgTransactionValue}}</div><div class='metric-label'>Avg. Value</div></div></div><h2>Traffic</h2><div class='metric-grid'><div class='metric'><div class='metric-value'>{{$json.analytics.sessions}}</div><div class='metric-label'>Sessions</div></div><div class='metric'><div class='metric-value'>{{$json.analytics.conversionRate}}%</div><div class='metric-label'>Conversion Rate</div></div><div class='metric'><div class='metric-value'>{{$json.analytics.bounceRate}}%</div><div class='metric-label'>Bounce Rate</div></div></div><h2>Pipeline</h2><div class='metric-grid'><div class='metric'><div class='metric-value'>{{$json.crm.newContacts}}</div><div class='metric-label'>New Contacts</div></div><div class='metric'><div class='metric-value'>{{$json.crm.dealsClosed}}</div><div class='metric-label'>Deals Closed</div></div><div class='metric'><div class='metric-value'>${{$json.crm.pipelineValue}}</div><div class='metric-label'>Pipeline Value</div></div></div><h2>AI Executive Summary</h2><div class='summary'>{{$json.aiSummary}}</div><footer>Pipeline: {{$json.pipelineId}} &bull; Status: {{$json.pipelineStatus}} &bull; Data Quality: {{$json.kpis.dataCompleteness}} &bull; Runtime: {{$json.durationSec}}s &bull; Trace: {{$json.traceId}}</footer></body></html>",
+        "options": {}
+      },
+      "id": "05000000-0000-0000-0000-000000000013",
+      "name": "notify.Email.DailyReport",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1820, 680],
+      "continueOnFail": true,
+      "credentials": { "smtp": { "id": "cred-smtp", "name": "SMTP — Notifications" } }
+    },
+
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "mode": "name", "value": "[SHARED] Structured Logger" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "level":      "=={{$json.pipelineStatus === 'COMPLETE' ? 'INFO' : 'WARN'}}",
+            "workflow":   "wf.etl-pipeline",
+            "event":      "pipeline.completed",
+            "message":    "=ETL pipeline {{$json.pipelineStatus}} for {{$json.reportDate}} in {{$json.durationSec}}s | Revenue ${{$json.revenue.netRevenue}} | Sessions {{$json.analytics.sessions}}",
+            "traceId":    "={{$json.traceId}}",
+            "data":       "={{ { pipelineId: $json.pipelineId, status: $json.pipelineStatus, dataCompleteness: $json.kpis.dataCompleteness, netRevenue: $json.revenue.netRevenue, sessions: $json.analytics.sessions } }}",
+            "durationMs": "={{$json.durationMs}}"
+          }
+        }
+      },
+      "id": "05000000-0000-0000-0000-000000000014",
+      "name": "log.PipelineCompleted",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2040, 580]
+    }
+  ],
+
+  "connections": {
+    "trigger.DailySchedule":     { "main": [[{ "node": "fn.InitContext",              "type": "main", "index": 0 }]] },
+    "fn.InitContext":             { "main": [[
+      { "node": "http.FetchAnalytics", "type": "main", "index": 0 },
+      { "node": "http.FetchCRM",       "type": "main", "index": 0 },
+      { "node": "http.FetchRevenue",   "type": "main", "index": 0 }
+    ]] },
+    "http.FetchAnalytics":        { "main": [[{ "node": "fn.TransformAndComputeKPIs", "type": "main", "index": 0 }]] },
+    "http.FetchCRM":              { "main": [[{ "node": "fn.TransformAndComputeKPIs", "type": "main", "index": 0 }]] },
+    "http.FetchRevenue":          { "main": [[{ "node": "fn.TransformAndComputeKPIs", "type": "main", "index": 0 }]] },
+    "fn.TransformAndComputeKPIs": { "main": [[{ "node": "gate.PipelineFailed?",        "type": "main", "index": 0 }]] },
+    "gate.PipelineFailed?": {
+      "main": [
+        [{ "node": "log.PipelineFailed",     "type": "main", "index": 0 }],
+        [{ "node": "sink.Sheets.StoreMetrics","type": "main", "index": 0 },
+         { "node": "ai.GenerateSummary",      "type": "main", "index": 0 }]
+      ]
+    },
+    "sink.Sheets.StoreMetrics":   { "main": [[{ "node": "fn.BuildReport", "type": "main", "index": 0 }]] },
+    "ai.GenerateSummary":         { "main": [[{ "node": "fn.BuildReport", "type": "main", "index": 0 }]] },
+    "fn.BuildReport":             { "main": [[
+      { "node": "notify.Slack.DailyReport",  "type": "main", "index": 0 },
+      { "node": "notify.Email.DailyReport",  "type": "main", "index": 0 }
+    ]] },
+    "notify.Slack.DailyReport":   { "main": [[{ "node": "log.PipelineCompleted", "type": "main", "index": 0 }]] },
+    "notify.Email.DailyReport":   { "main": [[{ "node": "log.PipelineCompleted", "type": "main", "index": 0 }]] }
+  },
+
+  "settings": {
+    "errorWorkflow":            "[SHARED] Global Error Handler",
+    "saveDataErrorExecution":   "all",
+    "saveDataSuccessExecution": "last",
+    "saveManualExecutions":     true,
+    "executionOrder":           "v1",
+    "timezone":                 "America/New_York"
+  },
+  "staticData": null,
+  "tags": ["etl", "pipeline", "reporting", "scheduled", "v2", "production"],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "v2.0.0"
+}
